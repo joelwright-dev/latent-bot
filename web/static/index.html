@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>latent-bot</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .pill { padding: 2px 8px; border-radius: 9999px; font-size: 11px; }
+    .tbl th { text-align: left; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid #1f2937; color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+    .tbl td { padding: 6px 8px; border-bottom: 1px solid #111827; font-size: 13px; }
+    .num { font-variant-numeric: tabular-nums; }
+    .card { background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; }
+    .input { background: #0b1220; border: 1px solid #1f2937; border-radius: 6px; padding: 6px 10px; color: #e2e8f0; font-size: 13px; }
+    .btn { background: #1e293b; border: 1px solid #334155; padding: 6px 12px; border-radius: 6px; font-size: 13px; }
+    .btn:hover { background: #334155; }
+    .btn-pri { background: #0ea5e9; border-color: #0284c7; color: #0b1220; }
+    .btn-pri:hover { background: #38bdf8; }
+    .tab { padding: 8px 14px; cursor: pointer; border-bottom: 2px solid transparent; color: #94a3b8; }
+    .tab.active { color: #e2e8f0; border-color: #0ea5e9; }
+    .log-line { font-size: 12px; padding: 3px 8px; border-left: 3px solid transparent; }
+    .log-info  { border-color: #0ea5e9; }
+    .log-warn  { border-color: #eab308; color: #fde68a; }
+    .log-error { border-color: #ef4444; color: #fca5a5; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-200">
+<div id="app" class="min-h-screen">
+  <header class="border-b border-slate-800 px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="text-lg font-semibold tracking-tight">latent-bot</div>
+      <span :class="{
+        'bg-emerald-600': status.indicator === 'green',
+        'bg-amber-500':  status.indicator === 'amber',
+        'bg-rose-600':   status.indicator === 'red',
+      }" class="pill text-slate-950 font-semibold">{{ status.indicator || '...' }}</span>
+      <span class="text-xs text-slate-500">uptime {{ fmtUptime(status.uptime_secs) }}</span>
+      <span v-if="status.paused_reason" class="text-xs text-rose-400">paused: {{ status.paused_reason }}</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <label class="text-xs text-slate-500">secret</label>
+      <input class="input" type="password" v-model="secret" placeholder="dashboard_secret" style="width: 180px" />
+    </div>
+  </header>
+
+  <nav class="border-b border-slate-800 flex gap-2 px-4">
+    <div v-for="t in tabs" :key="t" class="tab" :class="{ active: tab === t }" @click="tab = t">{{ t }}</div>
+  </nav>
+
+  <main class="p-6 space-y-6">
+
+    <!-- OVERVIEW -->
+    <section v-if="tab === 'overview'" class="grid grid-cols-4 gap-4">
+      <div class="card p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Trading Pool</div>
+        <div class="text-2xl font-semibold num mt-1">${{ fmt(pools.trading_pool) }}</div>
+        <div class="text-xs text-slate-500 mt-1 num">available ${{ fmt(pools.available_balance) }}</div>
+      </div>
+      <div class="card p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Gain Pool</div>
+        <div class="text-2xl font-semibold num mt-1 text-emerald-400">${{ fmt(pools.gain_pool) }}</div>
+        <div class="text-xs text-slate-500 mt-1">withdrawable</div>
+      </div>
+      <div class="card p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Today's Gross</div>
+        <div class="text-2xl font-semibold num mt-1">${{ fmt(stats.today?.gain) }}</div>
+        <div class="text-xs text-slate-500 mt-1 num">{{ stats.today?.count || 0 }} trades</div>
+      </div>
+      <div class="card p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">All-time Gross</div>
+        <div class="text-2xl font-semibold num mt-1">${{ fmt(stats.alltime?.gain) }}</div>
+        <div class="text-xs text-slate-500 mt-1 num">{{ stats.alltime?.count || 0 }} trades</div>
+      </div>
+
+      <div class="card p-4 col-span-2">
+        <div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Strategy A — UMA Sweeper</div>
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="num text-xl">${{ fmt(stats.strategy_a?.alltime?.gain) }}</div>
+            <div class="text-xs text-slate-500 num">{{ stats.strategy_a?.alltime?.count || 0 }} all-time</div>
+          </div>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" :checked="config.strategy_a_enabled" @change="toggleStrategy('A', $event.target.checked)" />
+            enabled
+          </label>
+        </div>
+      </div>
+      <div class="card p-4 col-span-2">
+        <div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Strategy B — Cascade Resolver</div>
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="num text-xl">${{ fmt(stats.strategy_b?.alltime?.gain) }}</div>
+            <div class="text-xs text-slate-500 num">{{ stats.strategy_b?.alltime?.count || 0 }} all-time</div>
+          </div>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" :checked="config.strategy_b_enabled" @change="toggleStrategy('B', $event.target.checked)" />
+            enabled
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <!-- OPEN POSITIONS -->
+    <section v-if="tab === 'positions'" class="card p-0 overflow-hidden">
+      <table class="tbl w-full">
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Strategy</th>
+            <th class="text-right">Entry</th>
+            <th class="text-right">Size</th>
+            <th class="text-right">Shares</th>
+            <th>Opened</th>
+            <th class="text-right">Est. P&amp;L</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="p in openPositions" :key="p.id" class="hover:bg-slate-900/40">
+            <td class="max-w-[400px] truncate">{{ p.question || p.market_token_id }}</td>
+            <td><span class="pill" :class="p.strategy === 'A' ? 'bg-sky-900 text-sky-200' : 'bg-violet-900 text-violet-200'">{{ p.strategy }}</span></td>
+            <td class="text-right num">{{ fmt(p.entry_price, 4) }}</td>
+            <td class="text-right num">${{ fmt(p.size_usdc) }}</td>
+            <td class="text-right num">{{ fmt(p.shares, 2) }}</td>
+            <td class="num">{{ fmtAge(p.opened_at) }}</td>
+            <td class="text-right num" :class="estPnl(p) >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+              {{ estPnl(p) >= 0 ? '+' : '' }}${{ fmt(estPnl(p)) }}
+            </td>
+            <td><span class="pill bg-slate-800 text-slate-300">{{ p.status }}</span></td>
+          </tr>
+          <tr v-if="openPositions.length === 0"><td colspan="8" class="text-center text-slate-500 py-8">No open positions.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- HISTORY -->
+    <section v-if="tab === 'history'" class="space-y-3">
+      <div class="flex gap-3 items-center">
+        <label class="text-xs text-slate-500">Strategy</label>
+        <select class="input" v-model="historyFilter.strategy" @change="loadHistory">
+          <option value="">all</option>
+          <option value="A">A</option>
+          <option value="B">B</option>
+        </select>
+        <label class="text-xs text-slate-500">From</label>
+        <input class="input" type="date" v-model="historyFilter.from" @change="loadHistory" />
+        <label class="text-xs text-slate-500">To</label>
+        <input class="input" type="date" v-model="historyFilter.to" @change="loadHistory" />
+      </div>
+      <div class="card p-0 overflow-hidden">
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th>Settled</th>
+              <th>Market</th>
+              <th>Strategy</th>
+              <th class="text-right">Entry</th>
+              <th class="text-right">Size</th>
+              <th class="text-right">Gain</th>
+              <th class="text-right">Gain %</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="h in history.rows" :key="h.id">
+              <td class="num">{{ fmtDate(h.settled_at) }}</td>
+              <td class="max-w-[400px] truncate">{{ h.question || h.market_token_id }}</td>
+              <td><span class="pill" :class="h.strategy === 'A' ? 'bg-sky-900 text-sky-200' : 'bg-violet-900 text-violet-200'">{{ h.strategy }}</span></td>
+              <td class="text-right num">{{ fmt(h.entry_price, 4) }}</td>
+              <td class="text-right num">${{ fmt(h.size_usdc) }}</td>
+              <td class="text-right num" :class="(h.gain_usdc || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'">${{ fmt(h.gain_usdc) }}</td>
+              <td class="text-right num">{{ fmt((h.gain_usdc || 0) / (h.size_usdc || 1) * 100, 2) }}%</td>
+            </tr>
+            <tr v-if="history.rows?.length === 0"><td colspan="7" class="text-center text-slate-500 py-8">No trades match this filter.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- CAPITAL -->
+    <section v-if="tab === 'capital'" class="space-y-4">
+      <div class="grid grid-cols-3 gap-4">
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Trading Pool</div>
+          <div class="text-2xl font-semibold num mt-1">${{ fmt(pools.trading_pool) }}</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Gain Pool</div>
+          <div class="text-2xl font-semibold num mt-1 text-emerald-400">${{ fmt(pools.gain_pool) }}</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Withdraw from Gain Pool</div>
+          <div class="flex gap-2">
+            <input class="input flex-1" type="number" step="0.01" v-model="withdrawAmount" placeholder="amount" />
+            <button class="btn btn-pri" @click="withdraw">Withdraw</button>
+          </div>
+        </div>
+      </div>
+      <div class="card p-0 overflow-hidden">
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Pool</th>
+              <th>Event</th>
+              <th class="text-right">Amount</th>
+              <th class="text-right">Balance After</th>
+              <th>Memo</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="l in ledger" :key="l.id">
+              <td class="num">{{ fmtDate(l.timestamp) }}</td>
+              <td><span class="pill" :class="l.pool === 'trading' ? 'bg-sky-900 text-sky-200' : 'bg-emerald-900 text-emerald-200'">{{ l.pool }}</span></td>
+              <td>{{ l.event_type }}</td>
+              <td class="text-right num" :class="l.amount >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+                {{ l.amount >= 0 ? '+' : '' }}${{ fmt(l.amount) }}
+              </td>
+              <td class="text-right num">${{ fmt(l.balance_after) }}</td>
+              <td class="text-slate-500">{{ l.memo }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- CONFIG -->
+    <section v-if="tab === 'config'" class="grid grid-cols-2 gap-4">
+      <div class="card p-4 space-y-3">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy A — UMA</div>
+        <label class="block text-sm">Deploy rate
+          <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_a_deploy_rate" />
+        </label>
+        <label class="block text-sm">Max concurrent
+          <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_a_max_concurrent" />
+        </label>
+        <label class="block text-sm">Bid price
+          <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_a_bid_price" />
+        </label>
+      </div>
+      <div class="card p-4 space-y-3">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy B — Cascade</div>
+        <label class="block text-sm">Deploy rate
+          <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_b_deploy_rate" />
+        </label>
+        <label class="block text-sm">Max position
+          <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_b_max_position" />
+        </label>
+        <label class="block text-sm">Bid price
+          <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_b_bid_price" />
+        </label>
+      </div>
+      <div class="card p-4 space-y-3 col-span-2">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Capital</div>
+        <label class="block text-sm">Gain pool split: <span class="num">{{ fmt(draft.gain_pool_split, 2) }}</span>
+          <input class="w-full mt-1" type="range" step="0.01" min="0" max="1" v-model.number="draft.gain_pool_split" />
+        </label>
+        <label class="block text-sm">Pause threshold (USDC)
+          <input class="input w-full mt-1" type="number" step="1" v-model.number="draft.trading_pool_pause_threshold" />
+        </label>
+        <label class="block text-sm">Min order size (USDC)
+          <input class="input w-full mt-1" type="number" step="0.5" v-model.number="draft.min_order_size" />
+        </label>
+        <button class="btn btn-pri" @click="saveConfig">Save Config</button>
+      </div>
+    </section>
+
+    <!-- EVENTS -->
+    <section v-if="tab === 'events'" class="card p-2 max-h-[70vh] overflow-auto">
+      <div v-for="e in events" :key="e.id" class="log-line" :class="'log-' + e.level">
+        <span class="text-slate-500 num">{{ fmtDate(e.timestamp) }}</span>
+        <span class="ml-2 text-slate-400">[{{ e.source }}]</span>
+        <span class="ml-2">{{ e.message }}</span>
+      </div>
+      <div v-if="events.length === 0" class="text-slate-500 text-center py-6">No events.</div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+const { createApp, reactive, ref, onMounted, computed } = Vue;
+
+createApp({
+  setup() {
+    const tab = ref('overview');
+    const tabs = ['overview', 'positions', 'history', 'capital', 'config', 'events'];
+    const secret = ref(localStorage.getItem('latentbot.secret') || '');
+
+    const status = reactive({});
+    const pools = reactive({});
+    const stats = reactive({});
+    const config = reactive({});
+    const draft = reactive({});
+    const ledger = ref([]);
+    const events = ref([]);
+    const openPositions = ref([]);
+    const history = reactive({ rows: [], page: 1, total: 0 });
+    const historyFilter = reactive({ strategy: '', from: '', to: '' });
+    const withdrawAmount = ref('');
+
+    // ---------- helpers ----------
+    const fmt = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '0.00' : Number(v).toFixed(d);
+    const fmtUptime = (s) => {
+      if (!s) return '—';
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+      return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    };
+    const fmtAge = (ts) => {
+      if (!ts) return '';
+      const s = Math.floor(Date.now() / 1000) - ts;
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.floor(s/60)}m`;
+      return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+    };
+    const fmtDate = (ts) => ts ? new Date(ts * 1000).toLocaleString() : '';
+    const estPnl = (p) => {
+      // Naive mark-to-$1 estimate — true mark requires live quote.
+      const sz = Number(p.size_usdc || 0);
+      const px = Number(p.entry_price || 0);
+      if (!sz || !px) return 0;
+      return sz * (1 / px - 1);
+    };
+
+    // ---------- api ----------
+    const authHeaders = () => secret.value ? { Authorization: `Bearer ${secret.value}` } : {};
+    const getJson = async (u) => {
+      const r = await fetch(u);
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    };
+    const postJson = async (u, body) => {
+      const r = await fetch(u, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    };
+
+    const refreshAll = async () => {
+      try { Object.assign(status, await getJson('/api/status')); } catch {}
+      try { Object.assign(pools,  await getJson('/api/pools'));  } catch {}
+      try { Object.assign(stats,  await getJson('/api/stats'));  } catch {}
+      try {
+        const c = await getJson('/api/config');
+        Object.assign(config, c);
+        Object.assign(draft, c);
+      } catch {}
+      try { openPositions.value = await getJson('/api/positions'); } catch {}
+      try { ledger.value = await getJson('/api/ledger?limit=100'); } catch {}
+      try { events.value = await getJson('/api/events?limit=200'); } catch {}
+    };
+
+    const loadHistory = async () => {
+      const qs = new URLSearchParams();
+      if (historyFilter.strategy) qs.set('strategy', historyFilter.strategy);
+      if (historyFilter.from) qs.set('start_ts', Math.floor(new Date(historyFilter.from).getTime()/1000));
+      if (historyFilter.to)   qs.set('end_ts',   Math.floor(new Date(historyFilter.to  ).getTime()/1000));
+      const r = await getJson('/api/history?' + qs.toString());
+      Object.assign(history, r);
+    };
+
+    const saveConfig = async () => {
+      try {
+        await postJson('/api/config', {
+          STRATEGY_A_DEPLOY_RATE: draft.strategy_a_deploy_rate,
+          STRATEGY_A_MAX_CONCURRENT: draft.strategy_a_max_concurrent,
+          STRATEGY_A_BID_PRICE: draft.strategy_a_bid_price,
+          STRATEGY_B_DEPLOY_RATE: draft.strategy_b_deploy_rate,
+          STRATEGY_B_MAX_POSITION: draft.strategy_b_max_position,
+          STRATEGY_B_BID_PRICE: draft.strategy_b_bid_price,
+          GAIN_POOL_SPLIT: draft.gain_pool_split,
+          TRADING_POOL_PAUSE_THRESHOLD: draft.trading_pool_pause_threshold,
+          MIN_ORDER_SIZE: draft.min_order_size,
+        });
+        localStorage.setItem('latentbot.secret', secret.value);
+        await refreshAll();
+      } catch (e) { alert('save failed: ' + e.message); }
+    };
+
+    const toggleStrategy = async (s, enabled) => {
+      try {
+        await postJson('/api/strategy/toggle', { strategy: s, enabled });
+        await refreshAll();
+      } catch (e) { alert(e.message); }
+    };
+
+    const withdraw = async () => {
+      try {
+        const amt = parseFloat(withdrawAmount.value);
+        if (!amt || amt <= 0) return;
+        await postJson('/api/capital/withdraw', { amount: amt });
+        withdrawAmount.value = '';
+        await refreshAll();
+      } catch (e) { alert(e.message); }
+    };
+
+    // ---------- websocket ----------
+    const connectWs = () => {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.onmessage = (m) => {
+        try {
+          const ev = JSON.parse(m.data);
+          // Any substantive change -> refresh relevant section.
+          if (['order_filled','position_settled','order_failed',
+               'dashboard_refresh','market_resolved'].includes(ev.type)) {
+            refreshAll();
+          }
+        } catch {}
+      };
+      ws.onclose = () => setTimeout(connectWs, 2000);
+    };
+
+    onMounted(async () => {
+      await refreshAll();
+      await loadHistory();
+      connectWs();
+      setInterval(refreshAll, 15000);
+    });
+
+    return {
+      tab, tabs, secret, status, pools, stats, config, draft, ledger,
+      events, openPositions, history, historyFilter, withdrawAmount,
+      fmt, fmtUptime, fmtAge, fmtDate, estPnl,
+      loadHistory, saveConfig, toggleStrategy, withdraw,
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
