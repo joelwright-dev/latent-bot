@@ -79,6 +79,13 @@ class StateManager:
         self._last_heartbeat = time.time()
         self._paused_reason: Optional[str] = None
 
+        # Strategy D current roster — set by StrategyD after each refresh,
+        # read by the web API for the "Leaders" dashboard tab. Keep it
+        # here rather than in Strategy D's module scope so the API has
+        # a single, stable place to look.
+        self.d_leaders: list[dict] = []
+        self.d_leaders_refreshed_at: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Boot
     # ------------------------------------------------------------------
@@ -117,29 +124,48 @@ class StateManager:
         *,
         question: str,
         condition_id: Optional[str] = None,
+        uma_question_id: Optional[str] = None,
+        polymarket_id: Optional[str] = None,
+        outcome_index: Optional[int] = None,
         category: Optional[str] = None,
         resolution_timestamp: Optional[int] = None,
         oracle_type: Optional[str] = None,
         status: str = "open",
+        last_trade_price: Optional[float] = None,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
+        volume_24h: Optional[float] = None,
+        accepting_orders: Optional[int] = None,
     ) -> Market:
         now = int(time.time())
         async with self._lock:
             await self.db.execute(
                 """INSERT INTO markets
-                   (token_id, condition_id, question, category,
-                    resolution_timestamp, oracle_type, status,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   (token_id, condition_id, uma_question_id, polymarket_id,
+                    outcome_index, question, category, resolution_timestamp,
+                    oracle_type, status, last_trade_price, best_bid, best_ask,
+                    volume_24h, accepting_orders, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(token_id) DO UPDATE SET
-                     condition_id = excluded.condition_id,
-                     question = excluded.question,
-                     category = excluded.category,
+                     condition_id         = excluded.condition_id,
+                     uma_question_id      = excluded.uma_question_id,
+                     polymarket_id        = excluded.polymarket_id,
+                     outcome_index        = excluded.outcome_index,
+                     question             = excluded.question,
+                     category             = excluded.category,
                      resolution_timestamp = excluded.resolution_timestamp,
-                     oracle_type = excluded.oracle_type,
-                     status = excluded.status,
-                     updated_at = excluded.updated_at""",
-                (token_id, condition_id, question, category,
-                 resolution_timestamp, oracle_type, status, now, now),
+                     oracle_type          = excluded.oracle_type,
+                     status               = excluded.status,
+                     last_trade_price     = excluded.last_trade_price,
+                     best_bid             = excluded.best_bid,
+                     best_ask             = excluded.best_ask,
+                     volume_24h           = excluded.volume_24h,
+                     accepting_orders     = excluded.accepting_orders,
+                     updated_at           = excluded.updated_at""",
+                (token_id, condition_id, uma_question_id, polymarket_id,
+                 outcome_index, question, category, resolution_timestamp,
+                 oracle_type, status, last_trade_price, best_bid, best_ask,
+                 volume_24h, accepting_orders, now, now),
             )
             m = Market(
                 token_id=token_id,

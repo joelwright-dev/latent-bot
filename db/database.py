@@ -28,7 +28,7 @@ import aiosqlite
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 9
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
@@ -46,14 +46,26 @@ class Database:
         self._write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        """Open the connection, apply schema, run migrations."""
+        """Open the connection, migrate any legacy schema, apply current schema."""
         if self._conn is not None:
             return
-        self._conn = await aiosqlite.connect(self.path)
+        # timeout=60 → aiosqlite waits up to 60s for the write lock if
+        # another process (e.g. seed_deposit.py, mark_sold.py) is writing.
+        # WAL mode keeps readers non-blocking; only writers serialise.
+        self._conn = await aiosqlite.connect(self.path, timeout=60.0)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA foreign_keys = ON")
-        await self._apply_schema()
+        await self._conn.execute("PRAGMA busy_timeout = 60000")
+        # Bootstrap the schema_version table so migrations can read it
+        # before we run the full schema.sql (which may contain indexes
+        # pointing at columns only added in later versions).
+        await self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)"
+        )
+        await self._conn.commit()
         await self._run_migrations()
+        await self._apply_schema()
         log.info("database connected at %s (schema v%d)", self.path, SCHEMA_VERSION)
 
     async def close(self) -> None:
@@ -68,20 +80,140 @@ class Database:
         await self._conn.commit()
 
     async def _run_migrations(self) -> None:
-        """Record the active schema version. Forward-only; future migrations
-        should add branches keyed on the stored value."""
+        """Forward-only schema migrations.
+
+        Each branch below bumps `current` by one until we hit SCHEMA_VERSION.
+        Migrations run inside a transaction so a failure leaves the
+        schema_version row untouched and we'll retry on next boot.
+        """
         assert self._conn is not None
-        cur = await self._conn.execute(
-            "SELECT MAX(version) FROM schema_version"
-        )
+        cur = await self._conn.execute("SELECT MAX(version) FROM schema_version")
         row = await cur.fetchone()
         current = row[0] if row and row[0] is not None else 0
-        if current < SCHEMA_VERSION:
+
+        while current < SCHEMA_VERSION:
+            target = current + 1
+            log.info("migrating schema %d -> %d", current, target)
+            if target == 2:
+                # v1 -> v2: add uma_question_id + outcome_index columns.
+                cur2 = await self._conn.execute("PRAGMA table_info(markets)")
+                cols = [r[1] for r in await cur2.fetchall()]
+                if cols:
+                    if "uma_question_id" not in cols:
+                        await self._conn.execute(
+                            "ALTER TABLE markets ADD COLUMN uma_question_id TEXT"
+                        )
+                    if "outcome_index" not in cols:
+                        await self._conn.execute(
+                            "ALTER TABLE markets ADD COLUMN outcome_index INTEGER"
+                        )
+            elif target == 3:
+                # v2 -> v3: add polymarket_id column for gamma "id" → UMA
+                # ancillaryData market_id mapping.
+                cur3 = await self._conn.execute("PRAGMA table_info(markets)")
+                cols = [r[1] for r in await cur3.fetchall()]
+                if cols and "polymarket_id" not in cols:
+                    await self._conn.execute(
+                        "ALTER TABLE markets ADD COLUMN polymarket_id TEXT"
+                    )
+            elif target == 4:
+                # v3 -> v4: add live pricing columns so the dashboard and
+                # Strategy C can work off cached prices (updated every seed
+                # cycle) instead of hammering the CLOB per-request.
+                cur4 = await self._conn.execute("PRAGMA table_info(markets)")
+                cols = [r[1] for r in await cur4.fetchall()]
+                if cols:
+                    for col, typ in (
+                        ("last_trade_price", "REAL"),
+                        ("best_bid",         "REAL"),
+                        ("best_ask",         "REAL"),
+                        ("volume_24h",       "REAL"),
+                        ("accepting_orders", "INTEGER"),
+                    ):
+                        if col not in cols:
+                            await self._conn.execute(
+                                f"ALTER TABLE markets ADD COLUMN {col} {typ}"
+                            )
+            elif target == 9:
+                # v8 -> v9: add Polymarket snapshot columns for
+                # reconciler-driven auto-settlement.
+                cur9 = await self._conn.execute("PRAGMA table_info(positions)")
+                cols = [r[1] for r in await cur9.fetchall()]
+                for col, typ in (
+                    ("pm_last_value",      "REAL"),
+                    ("pm_last_cash_pnl",   "REAL"),
+                    ("pm_last_redeemable", "INTEGER"),
+                    ("pm_last_sync_at",    "INTEGER"),
+                ):
+                    if col not in cols:
+                        await self._conn.execute(
+                            f"ALTER TABLE positions ADD COLUMN {col} {typ}"
+                        )
+            elif target in (5, 6, 7, 8):
+                # v4 -> v5: widen strategy check to ('A','B','C').
+                # v5 -> v6: widen strategy check to ('A','B','C','D').
+                # v6 -> v7: widen strategy check to ('A','B','C','D','M').
+                # v7 -> v8: add 'awaiting_redeem' to status check.
+                # SQLite can't ALTER a CHECK constraint — must rebuild.
+                if target >= 7:
+                    allowed = "'A', 'B', 'C', 'D', 'M'"
+                elif target == 6:
+                    allowed = "'A', 'B', 'C', 'D'"
+                else:
+                    allowed = "'A', 'B', 'C'"
+                status_allowed = (
+                    "'open', 'settled', 'cancelled', 'failed', 'awaiting_redeem'"
+                    if target >= 8 else
+                    "'open', 'settled', 'cancelled', 'failed'"
+                )
+                cur_x = await self._conn.execute("PRAGMA table_info(positions)")
+                has_positions = bool(await cur_x.fetchall())
+                if has_positions:
+                    await self._conn.execute("PRAGMA foreign_keys = OFF")
+                    await self._conn.execute(f"""
+                        CREATE TABLE positions_new (
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            market_token_id TEXT NOT NULL REFERENCES markets(token_id),
+                            strategy        TEXT NOT NULL CHECK(strategy IN ({allowed})),
+                            entry_price     REAL NOT NULL,
+                            size_usdc       REAL NOT NULL,
+                            shares          REAL NOT NULL,
+                            order_id        TEXT,
+                            tx_hash         TEXT,
+                            status          TEXT NOT NULL DEFAULT 'open'
+                                CHECK(status IN ({status_allowed})),
+                            opened_at       INTEGER NOT NULL,
+                            settled_at      INTEGER,
+                            gain_usdc       REAL,
+                            notes           TEXT
+                        )
+                    """)
+                    await self._conn.execute(
+                        "INSERT INTO positions_new SELECT * FROM positions"
+                    )
+                    await self._conn.execute("DROP TABLE positions")
+                    await self._conn.execute(
+                        "ALTER TABLE positions_new RENAME TO positions"
+                    )
+                    await self._conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_positions_status "
+                        "ON positions(status)"
+                    )
+                    await self._conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_positions_market "
+                        "ON positions(market_token_id)"
+                    )
+                    await self._conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_positions_strategy "
+                        "ON positions(strategy)"
+                    )
+                    await self._conn.execute("PRAGMA foreign_keys = ON")
             await self._conn.execute(
                 "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, int(time.time())),
+                (target, int(time.time())),
             )
             await self._conn.commit()
+            current = target
 
     # ------------------------------------------------------------------
     # Core query helpers. All writes go through _write_lock so concurrent

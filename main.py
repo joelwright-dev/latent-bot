@@ -31,12 +31,17 @@ from config import get_config
 from db.database import init_db
 from execution.executor import Executor
 from execution.settlement import Settlement
+from ingestion.market_seeder import MarketSeeder
 from ingestion.polygon_rpc import PolygonListener
 from ingestion.polymarket_ws import PolymarketWSListener
+from ingestion.position_reconciler import PositionReconciler
 from ingestion.state_manager import StateManager, set_state
 from strategies.dependency_graph import DependencyGraph
+from strategies.graph_builder import GraphBuilder
 from strategies.strategy_a import StrategyA
 from strategies.strategy_b import StrategyB
+from strategies.strategy_c import StrategyC
+from strategies.strategy_d import StrategyD
 from web.api import create_app, ws_fanout_loop
 
 logging.basicConfig(
@@ -59,10 +64,11 @@ def _build_clob() -> Optional[ClobClient]:
             host="https://clob.polymarket.com",
             key=cfg.private_key,
             chain_id=POLYGON,
-            signature_type=2,
+            signature_type=cfg.signature_type,
             funder=cfg.polymarket_proxy_address,
         )
         client.set_api_creds(client.create_or_derive_api_creds())
+        log.info("CLOB client initialised (signature_type=%d)", cfg.signature_type)
         return client
     except Exception:
         log.exception("CLOB client init failed — continuing without")
@@ -99,8 +105,13 @@ async def main() -> None:
 
     polygon = PolygonListener(state)
     ws_in   = PolymarketWSListener(state)
+    seeder  = MarketSeeder(state)
+    reconciler = PositionReconciler(state)
     strat_a = StrategyA(state, clob=clob)
     strat_b = StrategyB(state, graph=graph)
+    strat_c = StrategyC(state, clob=clob)
+    strat_d = StrategyD(state, clob=clob)
+    graph_builder = GraphBuilder(state, graph)
     executor = Executor(state)
     settlement = Settlement(state, clob=clob)
 
@@ -111,7 +122,7 @@ async def main() -> None:
     def _signal(*_):
         log.info("shutdown signal received")
         stop_event.set()
-        for c in (polygon, ws_in, strat_a, strat_b, executor, settlement):
+        for c in (polygon, ws_in, seeder, reconciler, graph_builder, strat_a, strat_b, strat_c, strat_d, executor, settlement):
             try:
                 c.stop()
             except Exception:
@@ -130,8 +141,13 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(polygon.run(),     name="polygon_rpc"),
         asyncio.create_task(ws_in.run(),       name="polymarket_ws"),
+        asyncio.create_task(seeder.run(),      name="market_seeder"),
+        asyncio.create_task(reconciler.run(),  name="position_reconciler"),
+        asyncio.create_task(graph_builder.run(), name="graph_builder"),
         asyncio.create_task(strat_a.run(),     name="strategy_a"),
         asyncio.create_task(strat_b.run(),     name="strategy_b"),
+        asyncio.create_task(strat_c.run(),     name="strategy_c"),
+        asyncio.create_task(strat_d.run(),     name="strategy_d"),
         asyncio.create_task(executor.run(),    name="executor"),
         asyncio.create_task(settlement.run(),  name="settlement"),
         asyncio.create_task(ws_fanout_loop(app, state), name="ws_fanout"),

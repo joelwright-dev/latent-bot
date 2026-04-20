@@ -73,14 +73,20 @@ async def get_gain_balance(db: Optional[Database] = None) -> float:
 
 
 async def get_available_balance(db: Optional[Database] = None) -> float:
-    """Trading pool balance minus capital currently locked in open positions.
+    """Trading pool balance minus capital currently locked in bot-managed
+    open positions.
+
+    Strategy 'M' (mirror) positions reflect manual trades made directly
+    on Polymarket — those used the user's own USDC, not the bot's
+    tracked pool, so they're excluded from the lock calculation.
 
     Used by risk.py to decide whether to fire a new trade.
     """
     db = db or get_db()
     balance = await get_trading_balance(db)
     locked = await db.fetchval(
-        "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions WHERE status = 'open'"
+        "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions "
+        "WHERE status = 'open' AND strategy != 'M'"
     )
     return balance - float(locked or 0.0)
 
@@ -244,6 +250,41 @@ async def settle_trade(
         position_id, principal, gross_proceeds, gain, to_trading, to_gain,
     )
     return to_trading, to_gain, gain
+
+
+async def refund_trade(
+    position_id: int,
+    principal: float,
+    *,
+    db: Optional[Database] = None,
+    memo: Optional[str] = None,
+) -> float:
+    """Restore principal to the trading pool when an order cancels unfilled.
+
+    Counterpart to open_trade(). Called by the executor when an order
+    times out without filling, so the locked capital gets freed and
+    Strategy A can size future trades correctly.
+    """
+    if principal <= 0:
+        raise PoolError(f"refund amount must be positive, got {principal}")
+    db = db or get_db()
+    async with db.transaction() as conn:
+        current = await _current_balance(conn, "trading")
+        new_balance = current + principal
+        await _append_ledger(
+            conn,
+            pool="trading",
+            event_type="adjustment",
+            amount=principal,
+            balance_after=new_balance,
+            position_id=position_id,
+            memo=memo or f"refund cancelled position {position_id}",
+        )
+        log.info(
+            "refund_trade: position=%d principal=%.2f trading_balance=%.2f",
+            position_id, principal, new_balance,
+        )
+        return new_balance
 
 
 async def record_withdrawal(

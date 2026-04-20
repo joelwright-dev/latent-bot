@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from py_clob_client.client import ClobClient
 
@@ -70,44 +70,70 @@ class StrategyA:
 
     async def _handle(self, signal: Signal) -> None:
         payload = signal.payload
-        qid = payload.get("question_id")
-        if not qid:
-            return
+        tx_hash = payload.get("tx_hash")
+        log_idx = payload.get("log_index")
+        polymarket_id = payload.get("polymarket_id")
 
-        # Dedup: UMA emits from time to time on re-proposals; only act once.
-        if qid in self._seen:
+        # Dedup by (tx_hash, log_index) — a unique fingerprint per event,
+        # so we don't trigger twice on reorgs re-delivering the same log.
+        dedup_key = f"{tx_hash}:{log_idx}"
+        if dedup_key in self._seen:
             return
-        self._seen.add(qid)
+        self._seen.add(dedup_key)
 
         proposed_price = int(payload.get("proposed_price", 0))
-        # UMA encodes YES as 1e18 and NO as 0 for binary outcome markets.
-        # A value at the midpoint or outside that range is ambiguous and
-        # we skip it. A proposer burning their bond on an ambiguous
-        # proposal is not a signal we want to trade.
         if proposed_price >= int(1e18 * 0.9):
             proposed_outcome = 1  # YES
         elif proposed_price <= int(1e18 * 0.1):
             proposed_outcome = 0  # NO
         else:
-            log.info("strategy A: ambiguous proposed_price=%d for qid=%s, skipping",
-                     proposed_price, qid)
+            log.info("strategy A: ambiguous proposed_price=%d for tx=%s, skipping",
+                     proposed_price, tx_hash)
             return
 
-        token_id = await self._resolve_winning_token(qid, proposed_outcome)
-        if token_id is None:
+        if not polymarket_id:
             await self.state.db.log_event(
                 "warn", "strategy_a",
-                f"could not map qid={qid} to Polymarket token",
+                f"no market_id in ancillaryData for tx={tx_hash}; cannot map",
+                {"tx_hash": tx_hash, "ancillary": payload.get("ancillary_snippet")},
             )
             return
 
-        # Make sure the market is in our registry so settlement can find it.
-        await self._ensure_registered(token_id, qid)
+        token_id = await self._resolve_winning_token_by_pm_id(
+            polymarket_id, proposed_outcome
+        )
+        if token_id is None:
+            await self.state.db.log_event(
+                "warn", "strategy_a",
+                f"could not map polymarket_id={polymarket_id} to token",
+                {"polymarket_id": polymarket_id, "proposed_outcome": proposed_outcome},
+            )
+            return
+
+        # Fetch the market's cached metadata for rich logging — lets us
+        # include question text, end date, cached prices in every proposal
+        # event. Helps post-hoc analysis of which markets are worth bidding.
+        meta = await self.state.db.fetchone(
+            "SELECT question, resolution_timestamp, last_trade_price, "
+            "best_bid, best_ask, volume_24h, accepting_orders "
+            "FROM markets WHERE token_id = ? LIMIT 1",
+            (token_id,),
+        )
+
+        # Query the actual order book to set a bid that'll fill.
+        market_bid = await self._market_derived_bid(token_id, meta=meta,
+                                                    polymarket_id=polymarket_id)
+        if market_bid is None:
+            return
 
         try:
-            req = await size_strategy_a(token_id)
+            req = await size_strategy_a(token_id, bid_price_override=market_bid)
         except StrategyPaused as e:
             log.info("strategy A paused for %s: %s", token_id, e)
+            await self.state.db.log_event(
+                "warn", "strategy_a", f"paused: {e}",
+                {"token_id": token_id, "polymarket_id": polymarket_id},
+            )
             return
         except RiskError as e:
             await self.state.db.log_event(
@@ -131,55 +157,137 @@ class StrategyA:
             "strategy A queued BUY %.2f USDC @ %.4f on %s",
             req.size_usdc, req.limit_price, req.token_id,
         )
+        await self.state.db.log_event(
+            "info", "strategy_a",
+            f"queued BUY {req.size_usdc:.2f} USDC @ {req.limit_price:.4f} "
+            f"on {req.token_id[:10]}...",
+            {"size_usdc": req.size_usdc, "limit_price": req.limit_price,
+             "token_id": req.token_id},
+        )
 
-    async def _resolve_winning_token(
-        self, question_id: str, proposed_outcome: int
+    async def _market_derived_bid(
+        self, token_id: str, meta=None, polymarket_id: Optional[str] = None,
+    ) -> Optional[float]:
+        """Query the CLOB order book and return a bid price that will
+        actually fill, or None if the trade shouldn't happen.
+
+        Logs a rich event on every decision with question text, end date,
+        book state, edge %, and why we took/skipped. Collected data lets
+        us assess whether Strategy A has any real edge after a day of
+        running.
+        """
+        if self._clob is None:
+            return None
+        try:
+            book = await asyncio.to_thread(self._clob.get_order_book, token_id)
+        except Exception as e:
+            await self.state.db.log_event(
+                "warn", "strategy_a",
+                f"order book fetch failed for {token_id[:10]}: {e}",
+            )
+            return None
+
+        asks = getattr(book, "asks", None) or (book.get("asks") if isinstance(book, dict) else None) or []
+        bids = getattr(book, "bids", None) or (book.get("bids") if isinstance(book, dict) else None) or []
+
+        def _price(e) -> float:
+            return float(getattr(e, "price", None) or e["price"])
+        def _size(e) -> float:
+            return float(getattr(e, "size", None) or e.get("size", 0))
+
+        best_ask = min((_price(a) for a in asks), default=None)
+        best_bid = max((_price(b) for b in bids), default=None)
+        ask_depth = sum(_size(a) for a in asks) if asks else 0.0
+        bid_depth = sum(_size(b) for b in bids) if bids else 0.0
+
+        question = meta["question"] if meta else None
+        end_ts = meta["resolution_timestamp"] if meta else None
+        volume = meta["volume_24h"] if meta else None
+        accepting = meta["accepting_orders"] if meta else None
+        edge_pct = ((1.0 - best_ask) * 100) if best_ask else None
+
+        # Build a common rich payload for the event log so every skip and
+        # every take is fully inspectable later.
+        data = {
+            "token_id": token_id,
+            "polymarket_id": polymarket_id,
+            "question": (question[:120] + "...") if question and len(question) > 120 else question,
+            "resolution_timestamp": end_ts,
+            "hours_to_resolution": (
+                round((end_ts - int(time.time())) / 3600, 1)
+                if end_ts else None
+            ),
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": (best_ask - best_bid) if (best_ask and best_bid) else None,
+            "bid_depth": bid_depth,
+            "ask_depth": ask_depth,
+            "edge_pct": edge_pct,
+            "volume_24h": volume,
+            "accepting_orders": accepting,
+        }
+
+        # Decision branches.
+        if not asks:
+            await self.state.db.log_event(
+                "info", "strategy_a",
+                f"skip (illiquid, no asks): {(question or token_id[:10])[:60]}",
+                data,
+            )
+            return None
+        if accepting == 0:
+            await self.state.db.log_event(
+                "warn", "strategy_a",
+                f"skip (market closed to orders): {(question or token_id[:10])[:60]}",
+                data,
+            )
+            return None
+        # Tunable thresholds: 0.999 = effectively certain, skip (no edge).
+        # 0.70 = market disagrees strongly, skip (proposer might be wrong
+        # or the market is weird). Wider than before to let more trades
+        # through — the floor is STRATEGY_A_BID_PRICE in config if you
+        # want a harder guard.
+        if best_ask >= 0.999:
+            await self.state.db.log_event(
+                "info", "strategy_a",
+                f"skip (no edge, ask={best_ask:.4f}): {(question or token_id[:10])[:60]}",
+                data,
+            )
+            return None
+        if best_ask < 0.70:
+            await self.state.db.log_event(
+                "warn", "strategy_a",
+                f"skip (ask={best_ask:.4f}, market disagrees): {(question or token_id[:10])[:60]}",
+                data,
+            )
+            return None
+
+        await self.state.db.log_event(
+            "info", "strategy_a",
+            f"TAKE ask={best_ask:.4f} edge={edge_pct:.2f}% depth={ask_depth:.0f}: "
+            f"{(question or token_id[:10])[:60]}",
+            data,
+        )
+        return best_ask
+
+    async def _resolve_winning_token_by_pm_id(
+        self, polymarket_id: str, proposed_outcome: int
     ) -> Optional[str]:
-        """Map UMA questionID -> Polymarket token_id of the winning side.
+        """Map Polymarket market id + proposed outcome → token_id.
 
-        Polymarket publishes the mapping via its gamma API. Without a CLOB
-        client we fall back to a registry lookup (condition_id column on
-        markets table is populated by market seeders or the dashboard).
+        The market_seeder populates markets.polymarket_id from gamma's
+        "id" field. Strategy A extracts the same id from UMA ancillaryData
+        (`market_id: <N>`). Exact match, no guessing.
         """
         db = self.state.db
-        # Polymarket's condition_id is derived from the UMA questionID on
-        # Polygon with a deterministic keccak; for simplicity we look it up
-        # from the markets table, which is the seed of truth populated by
-        # out-of-band tooling (market seed job not part of this module).
         row = await db.fetchone(
             """SELECT token_id FROM markets
-               WHERE condition_id = ? AND oracle_type = 'uma'
-               ORDER BY created_at DESC LIMIT 2""",
-            (question_id,),
+               WHERE polymarket_id = ? AND outcome_index = ?
+               LIMIT 1""",
+            (polymarket_id, proposed_outcome),
         )
-        if row:
-            return row["token_id"]
-        # Fallback: ask CLOB if wired.
-        if self._clob is not None:
-            try:
-                market = await asyncio.to_thread(
-                    self._clob.get_market, question_id
-                )
-                tokens = (market or {}).get("tokens") or []
-                for t in tokens:
-                    if int(t.get("outcome", -1)) == proposed_outcome:
-                        return t.get("token_id")
-            except Exception as e:
-                log.warning("CLOB market lookup failed for %s: %s", question_id, e)
-        return None
+        return row["token_id"] if row else None
 
-    async def _ensure_registered(self, token_id: str, question_id: str) -> None:
-        """Insert a skeleton market row if this is a new token to us."""
-        existing = self.state.get(token_id)
-        if existing is not None:
-            if existing.status != "proposed":
-                await self.state.set_status(token_id, "proposed")
-            return
-        await self.state.upsert_market(
-            token_id,
-            question=f"UMA qid {question_id[:10]}",
-            condition_id=question_id,
-            oracle_type="uma",
-            status="proposed",
-            resolution_timestamp=int(time.time()) + 2 * 3600,
-        )
+    # _ensure_registered removed — market_seeder populates the registry
+    # continuously, and we now resolve tokens by polymarket_id which is
+    # only populated by that seeder.

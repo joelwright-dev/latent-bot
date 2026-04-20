@@ -112,16 +112,26 @@ class PolymarketWSListener:
 
         if event_type in ("last_trade_price", "trade"):
             price = float(ev.get("price", 0))
-            # Polymarket marks a YES-resolved binary market's winning share
-            # at $1.00 at settlement. We treat the $1 crossing as the
-            # canonical on-chain-equivalent "resolved" trigger.
+            # ONLY trust the explicit 'resolved' event type below for
+            # resolution semantics. Price-based inference at >=0.999 gives
+            # too many false positives — intraday spikes, thin books — and
+            # causes the bot to prematurely settle positions whose USDC
+            # hasn't actually returned to the wallet.
+            #
+            # We still trigger Strategy B's cascade on near-$1 prices
+            # because those are directional signals (market consensus),
+            # not resolution claims — but we NO LONGER mark the market
+            # resolved based on price alone.
             if price >= 0.999:
                 signal = Signal(
                     kind=SignalKind.MARKET_RESOLVED,
-                    payload={"token_id": asset_id, "outcome": 1, "price": price},
+                    payload={"token_id": asset_id, "outcome": 1,
+                             "price": price, "source": "price_signal"},
                     source="polymarket_ws",
                 )
                 await self.state.emit(self.state.strategy_b_queue, signal)
+                # NOTE: removed the _resolve_sibling / market status update —
+                # price >= 0.999 is a directional signal, not resolution.
         elif event_type == "resolved":
             signal = Signal(
                 kind=SignalKind.MARKET_RESOLVED,
@@ -132,3 +142,27 @@ class PolymarketWSListener:
                 source="polymarket_ws",
             )
             await self.state.emit(self.state.strategy_b_queue, signal)
+            await self._resolve_sibling(asset_id)
+
+    async def _resolve_sibling(self, winner_token_id: str) -> None:
+        """When one side of a binary market resolves YES, the sibling
+        token is by definition NO. Mark it resolved with outcome=0 so
+        losing positions on it can settle (otherwise they'd sit open
+        forever — settlement only picks up rows where market.status =
+        'resolved')."""
+        row = await self.state.db.fetchone(
+            "SELECT condition_id FROM markets WHERE token_id = ? LIMIT 1",
+            (winner_token_id,),
+        )
+        if not row or not row["condition_id"]:
+            return
+        sibling = await self.state.db.fetchone(
+            "SELECT token_id FROM markets "
+            "WHERE condition_id = ? AND token_id != ? "
+            "AND status != 'resolved' LIMIT 1",
+            (row["condition_id"], winner_token_id),
+        )
+        if sibling:
+            await self.state.set_status(
+                sibling["token_id"], "resolved", resolved_outcome=0,
+            )

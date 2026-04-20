@@ -29,7 +29,7 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
-from capital.pools import InsufficientFundsError, open_trade
+from capital.pools import InsufficientFundsError, open_trade, refund_trade
 from config import get_config
 from db.database import Database, get_db
 from execution.risk import OrderRequest
@@ -59,7 +59,7 @@ class Executor:
             host=CLOB_HOST,
             key=cfg.private_key,
             chain_id=POLYGON,
-            signature_type=2,  # Polymarket proxy signature
+            signature_type=cfg.signature_type,
             funder=cfg.polymarket_proxy_address,
         )
         # L1 + L2 creds required for trading.
@@ -84,12 +84,15 @@ class Executor:
             req: OrderRequest = signal.payload["order"]
             try:
                 await self._execute(req)
-            except Exception:
+            except Exception as e:
                 log.exception("executor: unhandled error for %s", req)
                 await self.state.db.log_event(
                     "error", "executor",
-                    f"unhandled execution error for {req.token_id}",
-                    {"strategy": req.strategy},
+                    f"unhandled error on {req.strategy} order "
+                    f"for {req.token_id[:12]}...: {type(e).__name__}: {e}",
+                    {"strategy": req.strategy, "token_id": req.token_id,
+                     "exception_type": type(e).__name__,
+                     "exception_msg": str(e)[:500]},
                 )
 
     def stop(self) -> None:
@@ -104,6 +107,18 @@ class Executor:
         if shares <= 0:
             await db.log_event("error", "executor",
                                f"refused zero-share order: {req}")
+            return
+
+        # 0. Pre-flight: check market is still accepting orders. Protects
+        #    against the case where Polymarket closes a market at UMA
+        #    proposal time (Strategy A's premise would be broken in that
+        #    case and we'd just waste CLOB calls).
+        if not await self._market_accepting_orders(req.token_id):
+            await db.log_event(
+                "warn", "executor",
+                f"market not accepting orders, skipping",
+                {"token_id": req.token_id, "strategy": req.strategy},
+            )
             return
 
         # 1. Place the order. If the CLOB call raises we surface it and stop.
@@ -124,6 +139,13 @@ class Executor:
 
         order_id = order_response.get("orderID") or order_response.get("id")
         tx_hash = order_response.get("transactionHash") or order_response.get("txHash")
+
+        # 1a. Ensure the market exists in our registry before we insert
+        # the position — the positions.market_token_id column has a FK
+        # to markets(token_id). Strategy D copies can hit unseeded markets
+        # (NegRisk sub-markets etc.). Without a stub the INSERT fails
+        # AFTER the CLOB order was placed, leaving the order orphaned.
+        await self._ensure_market_stub(req.token_id)
 
         # 2. Persist position row + deduct trading pool atomically.
         try:
@@ -166,6 +188,39 @@ class Executor:
         # 3. Watch for fill.
         asyncio.create_task(self._watch_fill(position_id, order_id))
 
+    async def _ensure_market_stub(self, token_id: str) -> None:
+        """Guarantee a row exists in markets for this token so the
+        positions FK won't fail on insert. Cheap no-op when the row
+        already exists thanks to ON CONFLICT DO NOTHING."""
+        import time as _t
+        now = int(_t.time())
+        try:
+            await self.state.db.execute(
+                "INSERT INTO markets (token_id, question, status, "
+                "created_at, updated_at) VALUES (?, ?, 'open', ?, ?) "
+                "ON CONFLICT(token_id) DO NOTHING",
+                (token_id, f"(unseeded) {token_id[:20]}...", now, now),
+            )
+        except Exception as e:
+            log.warning("market stub insert failed for %s: %s", token_id, e)
+
+    async def _market_accepting_orders(self, token_id: str) -> bool:
+        """Query CLOB metadata for this token and check accepting_orders.
+        On any lookup failure we default to True (fail-open) — the order
+        placement will surface the real error if the market is closed."""
+        try:
+            market = await asyncio.to_thread(self.client().get_market, token_id)
+            if not market:
+                return True
+            # The CLOB sometimes returns a flag, sometimes nested — check both.
+            for flag in ("accepting_orders", "active", "enable_order_book"):
+                if flag in market and market[flag] is False:
+                    return False
+            return True
+        except Exception as e:
+            log.warning("pre-flight market check failed for %s: %s", token_id, e)
+            return True
+
     def _place_order(self, req: OrderRequest, shares: float) -> dict:
         """Blocking CLOB call — run via to_thread. Returns raw response."""
         args = OrderArgs(
@@ -205,25 +260,13 @@ class Executor:
                 ))
                 return
             if state in ("CANCELED", "CANCELLED", "EXPIRED"):
-                await db.execute(
-                    "UPDATE positions SET status = 'cancelled' WHERE id = ?",
-                    (position_id,),
-                )
-                await db.log_event(
-                    "warn", "executor",
-                    f"position {position_id} cancelled/expired ({state})",
-                )
+                await self._refund_and_mark_cancelled(position_id, state)
                 return
 
         # Timed out — cancel to free capital and mark failed.
         log.warning("order %s did not fill within timeout, cancelling", order_id)
         await self._cancel(order_id)
-        await db.execute(
-            "UPDATE positions SET status = 'cancelled' WHERE id = ?",
-            (position_id,),
-        )
-        await db.log_event("warn", "executor",
-                           f"position {position_id} cancelled (timeout)")
+        await self._refund_and_mark_cancelled(position_id, "timeout")
 
     async def _cancel(self, order_id: Optional[str]) -> None:
         if not order_id:
@@ -232,3 +275,74 @@ class Executor:
             await asyncio.to_thread(self.client().cancel, order_id)
         except Exception as e:
             log.error("cancel failed for %s: %s", order_id, e)
+
+    async def _refund_and_mark_cancelled(
+        self, position_id: int, reason: str
+    ) -> None:
+        """Mark a position cancelled AND refund its locked principal back
+        to the trading pool. Without the refund, capital stays phantom-
+        locked and the risk layer undersizes future trades."""
+        db = self.state.db
+        row = await db.fetchone(
+            "SELECT size_usdc, status, market_token_id, entry_price FROM positions WHERE id = ?",
+            (position_id,),
+        )
+        if not row:
+            return
+        # Idempotence: don't double-refund if already cancelled.
+        if row["status"] == "cancelled":
+            return
+        principal = float(row["size_usdc"])
+        our_bid = float(row["entry_price"])
+        token_id = row["market_token_id"]
+
+        # Snapshot the current order book so we can see WHY we didn't fill.
+        market_state = await self._snapshot_market(token_id)
+        await db.execute(
+            "UPDATE positions SET status = 'cancelled' WHERE id = ?",
+            (position_id,),
+        )
+        try:
+            await refund_trade(position_id, principal,
+                               memo=f"refund cancelled ({reason})")
+        except Exception as e:
+            log.error("refund failed for position %d: %s", position_id, e)
+            await db.log_event(
+                "error", "executor",
+                f"REFUND FAILED position {position_id}: {e}",
+            )
+            return
+        await db.log_event(
+            "warn", "executor",
+            f"position {position_id} cancelled ({reason}) — our_bid={our_bid:.4f} "
+            f"market={market_state} — refunded ${principal:.2f}",
+            {"position_id": position_id, "reason": reason,
+             "our_bid": our_bid, "market": market_state},
+        )
+
+    async def _snapshot_market(self, token_id: str) -> str:
+        """Return a compact string describing the current order book for
+        post-mortem: `bid=X ask=Y last=Z`. Best-effort — silent on error."""
+        try:
+            book = await asyncio.to_thread(self.client().get_order_book, token_id)
+        except Exception as e:
+            return f"<book fetch failed: {e}>"
+        asks = getattr(book, "asks", None) or (book.get("asks") if isinstance(book, dict) else None) or []
+        bids = getattr(book, "bids", None) or (book.get("bids") if isinstance(book, dict) else None) or []
+        def _p(e) -> float:
+            return float(getattr(e, "price", None) or e["price"])
+        best_ask = min((_p(a) for a in asks), default=None)
+        best_bid = max((_p(b) for b in bids), default=None)
+        last = None
+        try:
+            lt = await asyncio.to_thread(self.client().get_last_trade_price, token_id)
+            last = float(lt.get("price")) if isinstance(lt, dict) else None
+        except Exception:
+            pass
+        return (
+            f"bid={best_bid:.4f} " if best_bid is not None else "bid=— "
+        ) + (
+            f"ask={best_ask:.4f} " if best_ask is not None else "ask=— "
+        ) + (
+            f"last={last:.4f}" if last is not None else "last=—"
+        )

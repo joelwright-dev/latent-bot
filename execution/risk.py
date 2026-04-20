@@ -99,15 +99,16 @@ async def check_ready(strategy: str, db: Optional[Database] = None) -> None:
 async def size_strategy_a(
     token_id: str,
     db: Optional[Database] = None,
+    bid_price_override: Optional[float] = None,
 ) -> OrderRequest:
     """UMA sweeper sizing.
 
     trade_size = trading_pool * STRATEGY_A_DEPLOY_RATE / STRATEGY_A_MAX_CONCURRENT
 
-    Divided by max_concurrent so the sum of all simultaneously-open
-    Strategy A positions never exceeds STRATEGY_A_DEPLOY_RATE of the pool.
-    That keeps the strategy's aggregate exposure bounded regardless of how
-    many UMA proposals fire at once.
+    `bid_price_override` lets the caller pass a market-derived price
+    (from the order book) instead of the static config default. We
+    still clamp to [strategy_a_bid_price, 1.0] — the config value is
+    the *floor* below which we refuse to bid (edge too small).
     """
     cfg = get_config()
     db = db or get_db()
@@ -122,11 +123,16 @@ async def size_strategy_a(
             f"strategy A size {size:.2f} < MIN_ORDER_SIZE {cfg.min_order_size:.2f}"
         )
 
+    limit_price = bid_price_override if bid_price_override is not None else cfg.strategy_a_bid_price
+    # Never bid above 1.00 or below the config floor — the floor
+    # guarantees some edge, the ceiling prevents nonsense.
+    limit_price = max(cfg.strategy_a_bid_price, min(limit_price, 1.0))
+
     return OrderRequest(
         strategy="A",
         token_id=token_id,
         side="BUY",
-        limit_price=cfg.strategy_a_bid_price,
+        limit_price=round(limit_price, 4),
         size_usdc=round(size, 2),
         memo=f"strategy_a sweep {token_id[:10]}",
     )

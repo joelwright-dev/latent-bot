@@ -138,35 +138,24 @@ class StrategyB:
     async def _winning_token_for(
         self, condition_or_token: str, outcome: int
     ) -> Optional[str]:
-        """Resolve a child's market identifier to the token_id for the
-        winning side.
+        """Resolve a child's market identifier to the winning token_id.
 
-        We accept either a token_id or a condition_id as the child key. If
-        it's already a token that matches the implied outcome we return it;
-        otherwise we look up the sibling token via markets.condition_id.
+        Accepts either a token_id or a condition_id as the child key.
+        Binary markets have two rows — we pick the one with matching
+        outcome_index (1 = YES, 0 = NO) as populated by market_seeder.
         """
         db = self.state.db
-        # Direct token match.
+        # Direct token match — caller already handed us the right side.
         row = await db.fetchone(
-            "SELECT token_id, condition_id, metadata_json FROM markets "
-            "WHERE token_id = ?",
+            "SELECT token_id FROM markets WHERE token_id = ? LIMIT 1",
             (condition_or_token,),
         )
         if row:
             return row["token_id"]
-        # Fall back: treat as condition_id, look up both sides, pick outcome.
-        rows = await db.fetchall(
-            "SELECT token_id FROM markets WHERE condition_id = ? "
-            "ORDER BY token_id ASC",
-            (condition_or_token,),
+        # Treat as condition_id + outcome lookup.
+        row = await db.fetchone(
+            "SELECT token_id FROM markets "
+            "WHERE condition_id = ? AND outcome_index = ? LIMIT 1",
+            (condition_or_token, outcome),
         )
-        if not rows:
-            return None
-        # Convention: first token ordered asc is YES, second is NO. This
-        # matches Polymarket's tokens[0]/tokens[1] ordering for binary
-        # markets seeded via the gamma API.
-        if outcome == 1 and len(rows) >= 1:
-            return rows[0]["token_id"]
-        if outcome == 0 and len(rows) >= 2:
-            return rows[1]["token_id"]
-        return None
+        return row["token_id"] if row else None

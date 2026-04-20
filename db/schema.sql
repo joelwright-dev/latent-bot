@@ -13,6 +13,9 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS markets (
     token_id             TEXT PRIMARY KEY,
     condition_id         TEXT,
+    uma_question_id      TEXT,              -- UMA OO questionID for uma-oracled markets
+    polymarket_id        TEXT,              -- Polymarket's numeric market id (gamma "id")
+    outcome_index        INTEGER,           -- 1 = YES side, 0 = NO side
     question             TEXT NOT NULL,
     category             TEXT,
     resolution_timestamp INTEGER,
@@ -20,12 +23,21 @@ CREATE TABLE IF NOT EXISTS markets (
     status               TEXT NOT NULL DEFAULT 'open'
                              CHECK(status IN ('open', 'proposed', 'resolved', 'disputed', 'cancelled')),
     resolved_outcome     INTEGER,
+    -- Live pricing fields — populated by market_seeder every 5min from gamma
+    last_trade_price     REAL,
+    best_bid             REAL,
+    best_ask             REAL,
+    volume_24h           REAL,
+    accepting_orders     INTEGER,
     metadata_json        TEXT,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_markets_status ON markets(status);
-CREATE INDEX IF NOT EXISTS idx_markets_condition ON markets(condition_id);
+CREATE INDEX IF NOT EXISTS idx_markets_status     ON markets(status);
+CREATE INDEX IF NOT EXISTS idx_markets_condition  ON markets(condition_id);
+CREATE INDEX IF NOT EXISTS idx_markets_uma_qid    ON markets(uma_question_id);
+CREATE INDEX IF NOT EXISTS idx_markets_pm_id      ON markets(polymarket_id);
+CREATE INDEX IF NOT EXISTS idx_markets_resolution ON markets(resolution_timestamp);
 
 -- ---------------------------------------------------------------------------
 -- market_dependencies: directed edges for Strategy B cascade resolution.
@@ -52,17 +64,24 @@ CREATE INDEX IF NOT EXISTS idx_deps_child ON market_dependencies(child_market_id
 CREATE TABLE IF NOT EXISTS positions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     market_token_id TEXT NOT NULL REFERENCES markets(token_id),
-    strategy        TEXT NOT NULL CHECK(strategy IN ('A', 'B')),
+    strategy        TEXT NOT NULL CHECK(strategy IN ('A', 'B', 'C', 'D', 'M')),
     entry_price     REAL NOT NULL,
     size_usdc       REAL NOT NULL,
     shares          REAL NOT NULL,
     order_id        TEXT,
     tx_hash         TEXT,
     status          TEXT NOT NULL DEFAULT 'open'
-                        CHECK(status IN ('open', 'settled', 'cancelled', 'failed')),
+                        CHECK(status IN ('open', 'settled', 'cancelled', 'failed', 'awaiting_redeem')),
     opened_at       INTEGER NOT NULL,
     settled_at      INTEGER,
     gain_usdc       REAL,
+    -- Polymarket position snapshot, refreshed by PositionReconciler.
+    -- Used to settle automatically when the position disappears from
+    -- /positions (Polymarket auto-redeemed).
+    pm_last_value   REAL,
+    pm_last_cash_pnl REAL,
+    pm_last_redeemable INTEGER,
+    pm_last_sync_at INTEGER,
     notes           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);

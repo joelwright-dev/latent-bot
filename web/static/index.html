@@ -6,6 +6,7 @@
   <title>latent-bot</title>
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
   <style>
     body { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .pill { padding: 2px 8px; border-radius: 9999px; font-size: 11px; }
@@ -24,13 +25,22 @@
     .log-info  { border-color: #0ea5e9; }
     .log-warn  { border-color: #eab308; color: #fde68a; }
     .log-error { border-color: #ef4444; color: #fca5a5; }
+    .scrollbar-thin::-webkit-scrollbar { height: 4px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #1f2937; border-radius: 4px; }
+    @media (max-width: 640px) {
+      .tab { padding: 10px 12px; font-size: 12px; }
+      .btn { padding: 8px 14px; font-size: 14px; }
+      .input { padding: 8px 10px; font-size: 14px; }
+      .tbl th, .tbl td { padding: 8px 6px; font-size: 12px; }
+      .tbl th { font-size: 10px; }
+    }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-200">
 <div id="app" class="min-h-screen">
-  <header class="border-b border-slate-800 px-6 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-3">
-      <div class="text-lg font-semibold tracking-tight">latent-bot</div>
+  <header class="border-b border-slate-800 px-3 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-2">
+    <div class="flex items-center gap-2 sm:gap-3 flex-wrap">
+      <div class="text-base sm:text-lg font-semibold tracking-tight">latent-bot</div>
       <span :class="{
         'bg-emerald-600': status.indicator === 'green',
         'bg-amber-500':  status.indicator === 'amber',
@@ -39,20 +49,21 @@
       <span class="text-xs text-slate-500">uptime {{ fmtUptime(status.uptime_secs) }}</span>
       <span v-if="status.paused_reason" class="text-xs text-rose-400">paused: {{ status.paused_reason }}</span>
     </div>
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 flex-1 sm:flex-none justify-end min-w-0">
       <label class="text-xs text-slate-500">secret</label>
-      <input class="input" type="password" v-model="secret" placeholder="dashboard_secret" style="width: 180px" />
+      <input class="input flex-1 sm:flex-none min-w-0" type="password" v-model="secret" @input="saveSecret" placeholder="dashboard_secret" style="max-width: 180px" />
+      <span v-if="secret" class="text-xs text-emerald-400">saved</span>
     </div>
   </header>
 
-  <nav class="border-b border-slate-800 flex gap-2 px-4">
-    <div v-for="t in tabs" :key="t" class="tab" :class="{ active: tab === t }" @click="tab = t">{{ t }}</div>
+  <nav class="border-b border-slate-800 flex gap-1 sm:gap-2 px-2 sm:px-4 overflow-x-auto scrollbar-thin whitespace-nowrap">
+    <div v-for="t in tabs" :key="t" class="tab flex-shrink-0" :class="{ active: tab === t }" @click="tab = t">{{ t }}</div>
   </nav>
 
-  <main class="p-6 space-y-6">
+  <main class="p-3 sm:p-6 space-y-4 sm:space-y-6">
 
     <!-- OVERVIEW -->
-    <section v-if="tab === 'overview'" class="grid grid-cols-4 gap-4">
+    <section v-if="tab === 'overview'" class="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
       <div class="card p-4">
         <div class="text-xs text-slate-500 uppercase tracking-wider">Trading Pool</div>
         <div class="text-2xl font-semibold num mt-1">${{ fmt(pools.trading_pool) }}</div>
@@ -74,7 +85,7 @@
         <div class="text-xs text-slate-500 mt-1 num">{{ stats.alltime?.count || 0 }} trades</div>
       </div>
 
-      <div class="card p-4 col-span-2">
+      <div class="card p-4 col-span-2 md:col-span-2">
         <div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Strategy A — UMA Sweeper</div>
         <div class="flex items-center justify-between">
           <div>
@@ -87,7 +98,7 @@
           </label>
         </div>
       </div>
-      <div class="card p-4 col-span-2">
+      <div class="card p-4 col-span-2 md:col-span-2">
         <div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Strategy B — Cascade Resolver</div>
         <div class="flex items-center justify-between">
           <div>
@@ -102,8 +113,261 @@
       </div>
     </section>
 
+    <!-- POLYMARKET PORTFOLIO -->
+    <section v-if="tab === 'portfolio'" class="space-y-4">
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 sm:gap-4">
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Portfolio total</div>
+          <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.totals?.portfolio_total) }}</div>
+          <div class="text-xs text-slate-500 mt-1">positions + wallet</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Wallet USDC</div>
+          <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.totals?.wallet_usdc) }}</div>
+          <div class="text-xs text-slate-500 mt-1">free to trade</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Positions value</div>
+          <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.totals?.positions_current_value) }}</div>
+          <div class="text-xs text-slate-500 mt-1 num">from ${{ fmt(portfolio.totals?.positions_initial_value) }} cost</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Unrealised P&amp;L</div>
+          <div class="text-2xl font-semibold num mt-1"
+               :class="(portfolio.totals?.cash_pnl||0) >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+            {{ (portfolio.totals?.cash_pnl||0) >= 0 ? '+' : '' }}${{ fmt(portfolio.totals?.cash_pnl) }}
+          </div>
+          <div class="text-xs text-slate-500 mt-1">across {{ portfolio.totals?.count || 0 }} positions</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Max win if all resolve</div>
+          <div class="text-2xl font-semibold num mt-1 text-sky-400">${{ fmt(portfolio.totals?.to_win) }}</div>
+          <div class="text-xs text-slate-500 mt-1">if every position wins</div>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <div class="text-xs text-slate-500">Live view of polymarket.com portfolio. Refreshes every 30s.</div>
+        <button class="btn ml-auto" @click="loadPortfolio">refresh</button>
+      </div>
+
+      <div class="card p-0 overflow-x-auto">
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th style="min-width: 280px">Market</th>
+              <th>Outcome</th>
+              <th class="text-right">Avg → Now</th>
+              <th class="text-right">Shares</th>
+              <th class="text-right">Cost</th>
+              <th class="text-right">Value</th>
+              <th class="text-right">To win</th>
+              <th class="text-right">P&amp;L</th>
+              <th class="text-right">%</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="p in portfolio.positions || []" :key="p.asset">
+              <td class="truncate" style="max-width: 360px">{{ p.title }}</td>
+              <td>
+                <span class="pill bg-slate-800 text-slate-200">{{ p.outcome || '?' }}</span>
+              </td>
+              <td class="text-right num">
+                <span class="text-slate-400">{{ fmt(p.avg_price, 4) }}</span>
+                <span class="text-slate-600 mx-1">→</span>
+                <span :class="p.cur_price >= p.avg_price ? 'text-emerald-400' : 'text-rose-400'">
+                  {{ fmt(p.cur_price, 4) }}
+                </span>
+              </td>
+              <td class="text-right num">{{ fmt(p.size, 2) }}</td>
+              <td class="text-right num">${{ fmt(p.initial_value) }}</td>
+              <td class="text-right num font-semibold">${{ fmt(p.current_value) }}</td>
+              <td class="text-right num text-sky-400">${{ fmt(p.to_win) }}</td>
+              <td class="text-right num" :class="p.cash_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+                {{ p.cash_pnl >= 0 ? '+' : '' }}${{ fmt(p.cash_pnl) }}
+              </td>
+              <td class="text-right num" :class="p.pct_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+                {{ p.pct_pnl >= 0 ? '+' : '' }}{{ fmt(p.pct_pnl, 1) }}%
+              </td>
+              <td>
+                <span v-if="p.redeemable" class="pill bg-amber-800 text-amber-200">redeemable</span>
+                <span v-else class="text-slate-500">—</span>
+              </td>
+            </tr>
+            <tr v-if="(portfolio.positions || []).length === 0">
+              <td colspan="10" class="text-center text-slate-500 py-8">No positions on Polymarket.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- UPCOMING RESOLUTIONS -->
+    <section v-if="tab === 'upcoming'" class="space-y-3">
+      <div class="text-xs text-slate-500">
+        Rows highlighted <span class="px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-200">like this</span>
+        match your Strategy C criteria — the bot would enter these if enabled
+        <span v-if="!config.strategy_c_enabled" class="text-amber-400">(Strategy C is OFF)</span>.
+        Matching: <span class="text-emerald-400 font-semibold">{{ matchCount }}</span> of {{ upcoming.length }}.
+      </div>
+      <div class="flex gap-2 sm:gap-3 items-center flex-wrap">
+        <label class="text-xs text-slate-500">resolving within</label>
+        <select class="input" v-model.number="upcomingFilter.hours" @change="loadUpcoming">
+          <option :value="24">24 hours</option>
+          <option :value="72">3 days</option>
+          <option :value="168">1 week</option>
+          <option :value="336">2 weeks</option>
+          <option :value="720">1 month</option>
+          <option :value="2160">3 months</option>
+          <option :value="8760">1 year</option>
+        </select>
+        <label class="text-xs text-slate-500">YES ask</label>
+        <input class="input" type="number" step="0.05" min="0" max="1" v-model.number="upcomingFilter.minAsk" @change="loadUpcoming" style="width: 70px" />
+        <span class="text-xs text-slate-500">to</span>
+        <input class="input" type="number" step="0.05" min="0" max="1" v-model.number="upcomingFilter.maxAsk" @change="loadUpcoming" style="width: 70px" />
+        <button class="btn" @click="setPreset(0.00, 1.00)">all</button>
+        <button class="btn" @click="setPreset(0.85, 0.99)">YES</button>
+        <button class="btn" @click="setPreset(0.01, 0.15)">NO</button>
+        <button class="btn" @click="loadUpcoming">↻</button>
+        <span class="text-xs text-slate-500 ml-auto w-full sm:w-auto">{{ upcoming.length }} markets</span>
+      </div>
+      <div class="card p-0 overflow-x-auto">
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th style="min-width: 320px">Market</th>
+              <th>Category</th>
+              <th class="text-right">Resolves in</th>
+              <th class="text-right">YES bid</th>
+              <th class="text-right">YES ask</th>
+              <th class="text-right">Last</th>
+              <th class="text-right">Volume 24h</th>
+              <th class="text-right">Score</th>
+              <th>Bot</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="m in upcoming" :key="m.token_id"
+                :class="wouldBuy(m) ? 'bg-emerald-950/60 border-l-4 border-emerald-500' : 'hover:bg-slate-900/40'">
+              <td class="truncate" style="max-width: 480px">{{ m.question }}</td>
+              <td class="text-slate-400">{{ m.category || '—' }}</td>
+              <td class="text-right num" :class="m.hours_to_resolution < 24 ? 'text-amber-400' : ''">
+                {{ fmtHrs(m.hours_to_resolution) }}
+              </td>
+              <td class="text-right num">{{ fmt(m.best_bid, 4) }}</td>
+              <td class="text-right num" :class="askClass(m.best_ask)">{{ fmt(m.best_ask, 4) }}</td>
+              <td class="text-right num">{{ fmt(m.last_trade_price, 4) }}</td>
+              <td class="text-right num text-slate-500">${{ fmt(m.volume_24h, 0) }}</td>
+              <td class="text-right num font-semibold">{{ fmt(m.score, 2) }}</td>
+              <td>
+                <span v-if="wouldBuy(m)" class="pill bg-emerald-700 text-emerald-100 font-semibold">
+                  BUY {{ wouldBuy(m).side }} @ {{ fmt(wouldBuy(m).ask, 4) }}
+                </span>
+                <span v-else-if="whyNot(m)" class="text-xs text-slate-500">{{ whyNot(m) }}</span>
+              </td>
+            </tr>
+            <tr v-if="upcoming.length === 0">
+              <td colspan="9" class="text-center text-slate-500 py-8">No markets in range.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- STRATEGY D LEADERS -->
+    <section v-if="tab === 'leaders'" class="space-y-4">
+      <div class="flex items-center gap-3">
+        <div class="text-xs text-slate-500">
+          Traders Strategy D is copying. Green ticks = trade we mirrored.
+          <span v-if="!config.strategy_d_enabled" class="text-amber-400">(Strategy D is OFF)</span>
+          <span v-if="leadersMeta.refreshed_at" class="text-slate-600 ml-2">
+            last refreshed {{ fmtAge(Math.floor(leadersMeta.refreshed_at)) }} ago
+          </span>
+        </div>
+        <button class="btn ml-auto" @click="loadLeaders">refresh</button>
+      </div>
+      <div v-if="leaders.length === 0" class="card p-6 text-center text-slate-500">
+        {{ leadersMeta.note || 'No leaders loaded yet.' }}
+      </div>
+      <div v-for="lead in leaders" :key="lead.wallet" class="card p-3 sm:p-4 space-y-3">
+        <div class="flex items-baseline gap-2 sm:gap-3 flex-wrap">
+          <div class="text-base sm:text-lg font-semibold">{{ lead.pseudonym }}</div>
+          <div class="text-xs sm:text-sm text-slate-500 num">{{ lead.wallet.slice(0, 8) }}…{{ lead.wallet.slice(-4) }}</div>
+          <div class="sm:ml-auto flex gap-2 sm:gap-4 items-baseline flex-wrap w-full sm:w-auto">
+            <span class="text-xs text-slate-500">7d</span>
+            <span class="text-emerald-400 num font-semibold">${{ fmt(lead.pnl_7d, 0) }}</span>
+            <span class="text-xs text-slate-500">last</span>
+            <span class="num text-slate-300 text-xs sm:text-sm">{{ fmtAge(Math.floor(Date.now()/1000) - lead.last_trade_age_secs) }} ago</span>
+          </div>
+        </div>
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th style="min-width: 300px">Market</th>
+              <th>Outcome</th>
+              <th>Side</th>
+              <th class="text-right">Price</th>
+              <th class="text-right">Size</th>
+              <th>When</th>
+              <th>Copied</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="t in lead.trades" :key="t.tx_hash">
+              <td class="truncate" style="max-width: 420px">{{ t.title || '—' }}</td>
+              <td class="text-slate-400">{{ t.outcome }}</td>
+              <td>
+                <span class="pill" :class="t.side === 'BUY' ? 'bg-emerald-900 text-emerald-200' : 'bg-rose-900 text-rose-200'">
+                  {{ t.side }}
+                </span>
+              </td>
+              <td class="text-right num">{{ fmt(t.price, 4) }}</td>
+              <td class="text-right num">{{ fmt(t.size, 2) }}</td>
+              <td class="num text-slate-500">{{ fmtAgeDelta(t.age_secs) }} ago</td>
+              <td>
+                <span v-if="t.copied_by_us" class="pill bg-emerald-700 text-emerald-100">✓ copied</span>
+                <span v-else class="text-slate-600">—</span>
+              </td>
+            </tr>
+            <tr v-if="lead.trades.length === 0">
+              <td colspan="7" class="text-center text-slate-500 py-4">No recent trades</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- DEPENDENCY GRAPH -->
+    <section v-if="tab === 'graph'" class="space-y-3">
+      <div class="flex gap-2 sm:gap-3 items-center flex-wrap">
+        <label class="text-xs text-slate-500">within</label>
+        <select class="input" v-model.number="graphFilter.hours" @change="loadGraph">
+          <option :value="24">24 hours</option>
+          <option :value="72">3 days</option>
+          <option :value="168">1 week</option>
+          <option :value="720">1 month</option>
+          <option :value="8760">1 year</option>
+        </select>
+        <label class="text-xs text-slate-500">min cluster</label>
+        <input class="input" type="number" min="2" max="50" v-model.number="graphFilter.minCluster" @change="loadGraph" style="width: 60px" />
+        <button class="btn" @click="loadGraph">↻</button>
+        <span class="text-xs text-slate-500 ml-auto w-full sm:w-auto">
+          <span class="text-emerald-400 font-semibold">{{ graphMeta.shown_nodes || 0 }}</span> nodes,
+          {{ graphMeta.clusters || 0 }} clusters, {{ graphMeta.total_edges || 0 }} edges
+        </span>
+      </div>
+      <div class="text-xs text-slate-500">
+        Each cluster is a group of mutually-exclusive markets (same Polymarket event). When any one resolves YES,
+        Strategy B will sweep the NO sides of the others. Hover a node for the market question; click to zoom.
+      </div>
+      <div class="card p-0 overflow-x-auto">
+        <div ref="graphEl" style="height: 65vh; background: #060a14"></div>
+      </div>
+    </section>
+
     <!-- OPEN POSITIONS -->
-    <section v-if="tab === 'positions'" class="card p-0 overflow-hidden">
+    <section v-if="tab === 'positions'" class="card p-0 overflow-x-auto">
       <table class="tbl w-full">
         <thead>
           <tr>
@@ -137,19 +401,21 @@
 
     <!-- HISTORY -->
     <section v-if="tab === 'history'" class="space-y-3">
-      <div class="flex gap-3 items-center">
+      <div class="flex gap-2 sm:gap-3 items-center flex-wrap">
         <label class="text-xs text-slate-500">Strategy</label>
         <select class="input" v-model="historyFilter.strategy" @change="loadHistory">
           <option value="">all</option>
           <option value="A">A</option>
           <option value="B">B</option>
+          <option value="C">C</option>
+          <option value="D">D</option>
         </select>
         <label class="text-xs text-slate-500">From</label>
         <input class="input" type="date" v-model="historyFilter.from" @change="loadHistory" />
         <label class="text-xs text-slate-500">To</label>
         <input class="input" type="date" v-model="historyFilter.to" @change="loadHistory" />
       </div>
-      <div class="card p-0 overflow-hidden">
+      <div class="card p-0 overflow-x-auto">
         <table class="tbl w-full">
           <thead>
             <tr>
@@ -180,7 +446,7 @@
 
     <!-- CAPITAL -->
     <section v-if="tab === 'capital'" class="space-y-4">
-      <div class="grid grid-cols-3 gap-4">
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
         <div class="card p-4">
           <div class="text-xs text-slate-500 uppercase tracking-wider">Trading Pool</div>
           <div class="text-2xl font-semibold num mt-1">${{ fmt(pools.trading_pool) }}</div>
@@ -197,7 +463,7 @@
           </div>
         </div>
       </div>
-      <div class="card p-0 overflow-hidden">
+      <div class="card p-0 overflow-x-auto">
         <table class="tbl w-full">
           <thead>
             <tr>
@@ -226,7 +492,7 @@
     </section>
 
     <!-- CONFIG -->
-    <section v-if="tab === 'config'" class="grid grid-cols-2 gap-4">
+    <section v-if="tab === 'config'" class="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
       <div class="card p-4 space-y-3">
         <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy A — UMA</div>
         <label class="block text-sm">Deploy rate
@@ -251,7 +517,7 @@
           <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_b_bid_price" />
         </label>
       </div>
-      <div class="card p-4 space-y-3 col-span-2">
+      <div class="card p-4 space-y-3 md:col-span-2">
         <div class="text-xs text-slate-500 uppercase tracking-wider">Capital</div>
         <label class="block text-sm">Gain pool split: <span class="num">{{ fmt(draft.gain_pool_split, 2) }}</span>
           <input class="w-full mt-1" type="range" step="0.01" min="0" max="1" v-model.number="draft.gain_pool_split" />
@@ -280,13 +546,14 @@
 </div>
 
 <script>
-const { createApp, reactive, ref, onMounted, computed } = Vue;
+const { createApp, reactive, ref, onMounted, computed, watch } = Vue;
 
 createApp({
   setup() {
     const tab = ref('overview');
-    const tabs = ['overview', 'positions', 'history', 'capital', 'config', 'events'];
+    const tabs = ['overview', 'portfolio', 'upcoming', 'leaders', 'graph', 'positions', 'history', 'capital', 'config', 'events'];
     const secret = ref(localStorage.getItem('latentbot.secret') || '');
+    const saveSecret = () => localStorage.setItem('latentbot.secret', secret.value);
 
     const status = reactive({});
     const pools = reactive({});
@@ -298,6 +565,16 @@ createApp({
     const openPositions = ref([]);
     const history = reactive({ rows: [], page: 1, total: 0 });
     const historyFilter = reactive({ strategy: '', from: '', to: '' });
+    const upcoming = ref([]);
+    // Default to 14 days / any ask — user can narrow via the inputs.
+    const upcomingFilter = reactive({ hours: 336, minAsk: 0.00, maxAsk: 1.00 });
+    const graphEl = ref(null);
+    const graphFilter = reactive({ hours: 168, minCluster: 2 });
+    const graphMeta = reactive({});
+    let _visNetwork = null;
+    const leaders = ref([]);
+    const leadersMeta = reactive({});
+    const portfolio = reactive({ positions: [], totals: {} });
     const withdrawAmount = ref('');
 
     // ---------- helpers ----------
@@ -315,6 +592,64 @@ createApp({
       return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
     };
     const fmtDate = (ts) => ts ? new Date(ts * 1000).toLocaleString() : '';
+    const fmtHrs = (h) => {
+      if (h === null || h === undefined) return '—';
+      if (h < 1) return `${Math.round(h*60)}m`;
+      if (h < 48) return `${h.toFixed(1)}h`;
+      return `${Math.round(h/24)}d`;
+    };
+    const fmtAgeDelta = (s) => {
+      if (s === null || s === undefined) return '—';
+      if (s < 60)     return `${s}s`;
+      if (s < 3600)   return `${Math.floor(s/60)}m`;
+      if (s < 86400)  return `${Math.floor(s/3600)}h`;
+      return `${Math.floor(s/86400)}d`;
+    };
+    const askClass = (ask) => {
+      if (!ask) return 'text-slate-500';
+      if (ask >= 0.995) return 'text-slate-500';       // no edge
+      if (ask >= 0.90)  return 'text-emerald-400';     // good zone
+      if (ask >= 0.70)  return 'text-amber-400';       // uncertain
+      return 'text-slate-400';
+    };
+
+    // Replicates strategies/strategy_c.py::_consider logic client-side so
+    // the dashboard can show at a glance which rows the bot would trade.
+    // Returns {side, ask} if it'd enter, else false.
+    const wouldBuy = (m) => {
+      const minP = config.strategy_c_entry_price_min ?? 0.88;
+      const maxP = config.strategy_c_entry_price_max ?? 0.96;
+      const minV = config.strategy_c_min_volume_24h ?? 1000;
+      const maxH = config.strategy_c_hours_to_resolution ?? 24;
+      if (m.hours_to_resolution == null || m.hours_to_resolution > maxH) return false;
+      if ((m.volume_24h || 0) < minV) return false;
+      const askYes = m.best_ask, bidYes = m.best_bid;
+      if (askYes != null && askYes >= minP && askYes <= maxP) {
+        return { side: 'YES', ask: askYes };
+      }
+      if (bidYes != null) {
+        const askNo = 1 - bidYes;
+        if (askNo >= minP && askNo <= maxP) return { side: 'NO', ask: askNo };
+      }
+      return false;
+    };
+    // Human-readable reason why a row doesn't match.
+    const whyNot = (m) => {
+      const minP = config.strategy_c_entry_price_min ?? 0.88;
+      const maxP = config.strategy_c_entry_price_max ?? 0.96;
+      const minV = config.strategy_c_min_volume_24h ?? 1000;
+      const maxH = config.strategy_c_hours_to_resolution ?? 24;
+      if (m.hours_to_resolution == null) return 'no end date';
+      if (m.hours_to_resolution > maxH) return `${Math.round(m.hours_to_resolution)}h > ${maxH}h horizon`;
+      if ((m.volume_24h || 0) < minV) return `volume $${(m.volume_24h||0).toFixed(0)} < $${minV}`;
+      if (m.best_ask == null) return 'no ask';
+      const askNo = m.best_bid != null ? 1 - m.best_bid : null;
+      const yes_in = m.best_ask >= minP && m.best_ask <= maxP;
+      const no_in = askNo != null && askNo >= minP && askNo <= maxP;
+      if (!yes_in && !no_in) return `ask out of [${minP.toFixed(2)}, ${maxP.toFixed(2)}]`;
+      return '';
+    };
+    const matchCount = computed(() => upcoming.value.filter(wouldBuy).length);
     const estPnl = (p) => {
       // Naive mark-to-$1 estimate — true mark requires live quote.
       const sz = Number(p.size_usdc || 0);
@@ -352,6 +687,102 @@ createApp({
       try { openPositions.value = await getJson('/api/positions'); } catch {}
       try { ledger.value = await getJson('/api/ledger?limit=100'); } catch {}
       try { events.value = await getJson('/api/events?limit=200'); } catch {}
+    };
+
+    const loadPortfolio = async () => {
+      try {
+        const d = await getJson('/api/portfolio');
+        portfolio.positions = d.positions || [];
+        portfolio.totals = d.totals || {};
+      } catch (e) { /* ignore */ }
+    };
+
+    const loadLeaders = async () => {
+      try {
+        const d = await getJson('/api/leaders?trades_per_leader=10');
+        leaders.value = d.leaders || [];
+        Object.assign(leadersMeta, {
+          refreshed_at: d.refreshed_at,
+          note: d.note,
+        });
+      } catch (e) { /* ignore */ }
+    };
+
+    const loadGraph = async () => {
+      const qs = new URLSearchParams({
+        hours: graphFilter.hours,
+        min_cluster: graphFilter.minCluster,
+        limit_nodes: 400,
+      });
+      try {
+        const d = await getJson('/api/graph?' + qs.toString());
+        Object.assign(graphMeta, {
+          shown_nodes: d.shown_nodes,
+          clusters: d.clusters,
+          total_edges: d.total_edges,
+        });
+        renderGraph(d);
+      } catch (e) { /* ignore */ }
+    };
+
+    const renderGraph = (data) => {
+      if (!graphEl.value || !window.vis) return;
+      // Color node by proximity to resolution (warmer = sooner).
+      const nodeColor = (h) => {
+        if (h == null) return '#475569';
+        if (h < 24)   return '#ef4444';
+        if (h < 72)   return '#f59e0b';
+        if (h < 168)  return '#0ea5e9';
+        return '#6366f1';
+      };
+      const visNodes = data.nodes.map(n => ({
+        id: n.id,
+        label: n.label,
+        title: (n.title || '') +
+          `\nresolves in: ${n.hours_to_resolution == null ? '—' : n.hours_to_resolution + 'h'}` +
+          `\nYES ask: ${n.best_ask != null ? n.best_ask.toFixed(4) : '—'}` +
+          `\n24h vol: $${n.volume_24h != null ? n.volume_24h.toFixed(0) : '—'}` +
+          (n.category ? `\ncategory: ${n.category}` : ''),
+        color: { background: nodeColor(n.hours_to_resolution), border: '#1e293b' },
+        font: { color: '#e2e8f0', size: 11 },
+        size: 8 + Math.min(20, Math.sqrt(Math.max(0, n.volume_24h || 0)) * 0.05),
+      }));
+      const visEdges = data.edges.map(e => ({
+        from: e.from, to: e.to,
+        color: { color: '#334155', opacity: 0.6 },
+        width: 1,
+      }));
+      const container = graphEl.value;
+      const payload = { nodes: new vis.DataSet(visNodes), edges: new vis.DataSet(visEdges) };
+      const options = {
+        interaction: { hover: true, tooltipDelay: 120, zoomView: true },
+        nodes: { shape: 'dot', borderWidth: 1 },
+        edges: { smooth: false },
+        physics: {
+          solver: 'forceAtlas2Based',
+          forceAtlas2Based: { gravitationalConstant: -40, springLength: 60 },
+          stabilization: { iterations: 150 },
+        },
+      };
+      if (_visNetwork) _visNetwork.destroy();
+      _visNetwork = new vis.Network(container, payload, options);
+    };
+
+    const loadUpcoming = async () => {
+      const qs = new URLSearchParams({
+        hours: upcomingFilter.hours,
+        min_ask: upcomingFilter.minAsk,
+        max_ask: upcomingFilter.maxAsk,
+        limit: 2000,
+      });
+      try {
+        upcoming.value = await getJson('/api/upcoming?' + qs.toString());
+      } catch (e) { /* ignore */ }
+    };
+    const setPreset = (lo, hi) => {
+      upcomingFilter.minAsk = lo;
+      upcomingFilter.maxAsk = hi;
+      loadUpcoming();
     };
 
     const loadHistory = async () => {
@@ -415,17 +846,36 @@ createApp({
       ws.onclose = () => setTimeout(connectWs, 2000);
     };
 
+    // Lazy-load the graph tab: loading the vis-network layout is
+    // expensive, so only kick it off when the user opens the tab.
+    // Leaders tab also lazy-loaded to avoid N leader API calls on mount.
+    watch(tab, (t) => {
+      if (t === 'graph') setTimeout(loadGraph, 50);
+      if (t === 'leaders') loadLeaders();
+      if (t === 'portfolio') loadPortfolio();
+    });
+
     onMounted(async () => {
       await refreshAll();
       await loadHistory();
+      await loadUpcoming();
       connectWs();
       setInterval(refreshAll, 15000);
+      setInterval(loadUpcoming, 30000);
+      // Refresh portfolio when user is on that tab; cheap guard keeps
+      // us from hammering the Polymarket API when idle elsewhere.
+      setInterval(() => { if (tab.value === 'portfolio') loadPortfolio(); }, 30000);
     });
 
     return {
-      tab, tabs, secret, status, pools, stats, config, draft, ledger,
+      tab, tabs, secret, saveSecret, status, pools, stats, config, draft, ledger,
       events, openPositions, history, historyFilter, withdrawAmount,
-      fmt, fmtUptime, fmtAge, fmtDate, estPnl,
+      upcoming, upcomingFilter, loadUpcoming, setPreset,
+      wouldBuy, whyNot, matchCount,
+      graphEl, graphFilter, graphMeta, loadGraph,
+      leaders, leadersMeta, loadLeaders, fmtAgeDelta,
+      portfolio, loadPortfolio,
+      fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl,
       loadHistory, saveConfig, toggleStrategy, withdraw,
     };
   }
