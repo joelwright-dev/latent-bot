@@ -16,6 +16,10 @@ from __future__ import annotations
 
 import sys
 import traceback
+from pathlib import Path
+
+# Make the project root importable so this script can run from scripts/.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
