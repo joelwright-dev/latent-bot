@@ -169,6 +169,13 @@ def create_app(state: StateManager) -> FastAPI:
         out = []
         for r in rows:
             d = _row_to_dict(r)
+            # Hide resolved-loser positions whose Polymarket snapshot
+            # shows the shares have effectively gone to zero. These are
+            # just sitting there waiting to be auto-redeemed by
+            # Polymarket — no future value, cluttering the view.
+            pm_value = d.get("pm_last_value")
+            if pm_value is not None and float(pm_value) < 0.01 and d.get("pm_last_redeemable"):
+                continue
             # Derived fields for the monitor view.
             entry = float(d.get("entry_price") or 0)
             peak = float(d.get("peak_price") or 0) or entry
@@ -507,6 +514,15 @@ def create_app(state: StateManager) -> FastAPI:
             cash_pnl = float(p.get("cashPnl") or (current_value - initial_value))
             pct_pnl = float(p.get("percentPnl") or 0)
             to_win = size  # if outcome = 1, each share = $1
+
+            # Hide resolved losers: position is redeemable + market resolved
+            # against it (current price is effectively 0). These positions
+            # have no future value, just waste portfolio-view space and
+            # drag down the totals. Winners (price near $1) stay — we want
+            # to see those until they auto-redeem and disappear naturally.
+            redeemable = bool(p.get("redeemable"))
+            if redeemable and cur_price < 0.01:
+                continue
             positions.append({
                 "title": p.get("title"),
                 "outcome": p.get("outcome"),

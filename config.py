@@ -74,6 +74,7 @@ class Config:
     strategy_d_copy_window_secs: int      # only copy trades within N sec of now
     strategy_d_num_leaders: int           # how many top traders to follow
     strategy_d_max_leader_idle_hours: int # drop a leader if no trades in this window
+    strategy_d_max_entry_price: float     # skip buys above this price (limits risk/reward ratio)
 
     # PositionMonitor (auto-exit logic for Strategy D copy trades)
     monitor_enabled: bool
@@ -187,6 +188,7 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_copy_window_secs=_i(values.get("STRATEGY_D_COPY_WINDOW_SECS"), 900),
         strategy_d_num_leaders=_i(values.get("STRATEGY_D_NUM_LEADERS"), 5),
         strategy_d_max_leader_idle_hours=_i(values.get("STRATEGY_D_MAX_LEADER_IDLE_HOURS"), 24),
+        strategy_d_max_entry_price=_f(values.get("STRATEGY_D_MAX_ENTRY_PRICE"), 0.95),
         monitor_enabled=_b(values.get("MONITOR_ENABLED"), True),
         monitor_poll_secs=_i(values.get("MONITOR_POLL_SECS"), 30),
         monitor_max_loss_pct=_f(values.get("MONITOR_MAX_LOSS_PCT"), 0.50),

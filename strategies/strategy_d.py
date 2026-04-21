@@ -294,6 +294,21 @@ class StrategyD:
             )
             return
 
+        # Hard ceiling on entry price. A buy at $0.99 has 1¢ upside
+        # against 99¢ downside — tail-risk disaster even if we "win"
+        # most of them. Set via STRATEGY_D_MAX_ENTRY_PRICE in .env.
+        if current_ask > cfg.strategy_d_max_entry_price:
+            await self.state.db.log_event(
+                "info", "strategy_d",
+                f"skip (entry {current_ask:.4f} > cap {cfg.strategy_d_max_entry_price:.4f}) "
+                f"from {leader.pseudonym}: {title[:60]} [{outcome}]",
+                {"leader": leader.wallet, "token_id": token_id,
+                 "current_ask": current_ask,
+                 "max_entry_price": cfg.strategy_d_max_entry_price,
+                 "title": title, "outcome": outcome},
+            )
+            return
+
         # Dual cap: use the LOOSER of percentage or absolute. Percentage
         # works for expensive positions ($0.97 → 3% is $0.029); absolute
         # works for cheap positions (where 10% of $0.06 = half a cent but
