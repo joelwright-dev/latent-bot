@@ -272,6 +272,35 @@ class PositionMonitor:
              "shares": shares, "token_id": token_id},
         )
 
+        # Reconcile shares against Polymarket's actual balance. Our DB
+        # stores the shares we intended to buy (size_usdc / limit_price),
+        # but CLOB partial fills / pooling across multiple same-token
+        # positions means the real balance can be lower. If we try to
+        # sell more than we have, Polymarket rejects the order. Cap at
+        # what actually exists on-chain.
+        actual_shares = await self._actual_token_balance(token_id)
+        if actual_shares is not None and actual_shares < shares:
+            if actual_shares < 0.01:
+                # Nothing to sell — mark settled as a loss using principal
+                # spent and give up. Reconciler will catch up if the
+                # position is actually still there.
+                await db.log_event(
+                    "warn", "monitor",
+                    f"#{pos_id} has 0 shares on Polymarket, nothing to sell. "
+                    f"DB thought we held {shares:.2f}.",
+                    {"position_id": pos_id, "db_shares": shares},
+                )
+                self._exiting.discard(pos_id)
+                return
+            await db.log_event(
+                "info", "monitor",
+                f"#{pos_id} DB says {shares:.2f} shares, Polymarket says "
+                f"{actual_shares:.2f} — capping sell at actual balance",
+                {"position_id": pos_id, "db_shares": shares,
+                 "actual_shares": actual_shares},
+            )
+            shares = actual_shares
+
         # Place a SELL at the current bid. If the book moved against us
         # by the time the order lands, it'll rest at that price; the
         # reconciler picks up any unfilled sells on its next cycle.
@@ -430,6 +459,39 @@ class PositionMonitor:
     # ------------------------------------------------------------------
     # CLOB helpers
     # ------------------------------------------------------------------
+    async def _actual_token_balance(self, token_id: str) -> Optional[float]:
+        """Query Polymarket for the wallet's actual share balance on this
+        token. Returns None if we can't determine (no data endpoint, or
+        token not found in positions). Used before placing a sell so we
+        don't over-request and get rejected."""
+        cfg = get_config()
+        wallet = cfg.polymarket_proxy_address
+        if not wallet:
+            return None
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as s:
+                async with s.get(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": wallet},
+                ) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+        except Exception:
+            return None
+        positions = data if isinstance(data, list) else (
+            data.get("data") if isinstance(data, dict) else []
+        )
+        for p in positions or []:
+            if str(p.get("asset") or "") == token_id:
+                try:
+                    return float(p.get("size") or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0  # not in our positions → 0 shares
+
     async def _live_best_bid(self, token_id: str) -> Optional[float]:
         """Return the best bid on the book — the realistic exit price."""
         if self._clob is None:
