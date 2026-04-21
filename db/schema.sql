@@ -82,6 +82,13 @@ CREATE TABLE IF NOT EXISTS positions (
     pm_last_cash_pnl REAL,
     pm_last_redeemable INTEGER,
     pm_last_sync_at INTEGER,
+    -- PositionMonitor fields — highest price reached since entry (for
+    -- trailing stop calc) and the reason we exited when we do.
+    peak_price      REAL,
+    exit_reason     TEXT,
+    -- Strategy D: wallet of the leader this copy mirrors. Used by
+    -- position_monitor for the trader_exit signal.
+    leader_wallet   TEXT,
     notes           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);

@@ -74,6 +74,37 @@ def create_app(state: StateManager) -> FastAPI:
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     # ------------------------------------------------------------------
+    # GET /api/health  — simple liveness + version endpoint used by the
+    # auto-redeploy script to verify the new build started cleanly.
+    # ------------------------------------------------------------------
+    @app.get("/api/health")
+    async def health() -> dict:
+        import time as _t
+        now = _t.time()
+        try:
+            trading_pool = await pools.get_trading_balance()
+        except Exception:
+            trading_pool = None
+        try:
+            open_positions = await get_db().fetchval(
+                "SELECT COUNT(*) FROM positions "
+                "WHERE status IN ('open', 'awaiting_redeem')"
+            )
+            open_positions = int(open_positions or 0)
+        except Exception:
+            open_positions = None
+        bot_running = state.paused_reason is None
+        return {
+            "status": "ok",
+            "uptime_seconds": int(now - state.started_at),
+            "version": getattr(app.state, "git_commit", "unknown"),
+            "trading_pool": trading_pool,
+            "open_positions": open_positions,
+            "bot_running": bot_running,
+            "paused_reason": state.paused_reason,
+        }
+
+    # ------------------------------------------------------------------
     # GET /api/status
     # ------------------------------------------------------------------
     @app.get("/api/status")
@@ -131,11 +162,32 @@ def create_app(state: StateManager) -> FastAPI:
             rows = await db.fetchall(
                 """SELECT p.*, m.question FROM positions p
                    LEFT JOIN markets m ON m.token_id = p.market_token_id
-                   WHERE p.status = 'open'
+                   WHERE p.status IN ('open', 'awaiting_redeem')
                    ORDER BY p.opened_at DESC LIMIT ?""",
                 (limit,),
             )
-        return [_row_to_dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = _row_to_dict(r)
+            # Derived fields for the monitor view.
+            entry = float(d.get("entry_price") or 0)
+            peak = float(d.get("peak_price") or 0) or entry
+            if entry > 0 and peak >= entry:
+                gain_mult = peak / entry
+                # Mirror the tiered logic from position_monitor.
+                if gain_mult >= 50:
+                    trail_pct = 0.10
+                elif gain_mult >= 20:
+                    trail_pct = 0.15
+                elif gain_mult >= 5:
+                    trail_pct = 0.25
+                else:
+                    trail_pct = 0.40
+                d["trailing_stop_pct"] = trail_pct
+                d["trailing_stop_price"] = round(peak * (1.0 - trail_pct), 4)
+                d["peak_gain_multiple"] = round(gain_mult, 2)
+            out.append(d)
+        return out
 
     # ------------------------------------------------------------------
     # GET /api/history

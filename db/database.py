@@ -28,7 +28,7 @@ import aiosqlite
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
@@ -149,6 +149,26 @@ class Database:
                         await self._conn.execute(
                             f"ALTER TABLE positions ADD COLUMN {col} {typ}"
                         )
+            elif target == 10:
+                # v9 -> v10: PositionMonitor fields.
+                cur10 = await self._conn.execute("PRAGMA table_info(positions)")
+                cols = [r[1] for r in await cur10.fetchall()]
+                for col, typ in (
+                    ("peak_price",  "REAL"),
+                    ("exit_reason", "TEXT"),
+                ):
+                    if col not in cols:
+                        await self._conn.execute(
+                            f"ALTER TABLE positions ADD COLUMN {col} {typ}"
+                        )
+            elif target == 11:
+                # v10 -> v11: leader_wallet for trader-exit signal.
+                cur11 = await self._conn.execute("PRAGMA table_info(positions)")
+                cols = [r[1] for r in await cur11.fetchall()]
+                if "leader_wallet" not in cols:
+                    await self._conn.execute(
+                        "ALTER TABLE positions ADD COLUMN leader_wallet TEXT"
+                    )
             elif target in (5, 6, 7, 8):
                 # v4 -> v5: widen strategy check to ('A','B','C').
                 # v5 -> v6: widen strategy check to ('A','B','C','D').

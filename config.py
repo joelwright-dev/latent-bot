@@ -75,6 +75,21 @@ class Config:
     strategy_d_num_leaders: int           # how many top traders to follow
     strategy_d_max_leader_idle_hours: int # drop a leader if no trades in this window
 
+    # PositionMonitor (auto-exit logic for Strategy D copy trades)
+    monitor_enabled: bool
+    monitor_poll_secs: int
+    monitor_max_loss_pct: float           # e.g. 0.50 = exit if price < 50% of entry
+    monitor_timeout_hours: int            # e.g. 48 = exit stale positions
+    monitor_timeout_min_multiple: float   # e.g. 2.0 = only time-out if peak < 2x entry
+    monitor_pre_resolution_hours: float   # e.g. 1.0 = sell in profit if <1h to resolve
+    # Defensive tuning: avoids firing on flash dips and freshly-opened
+    # positions that haven't had time to find their level yet.
+    monitor_confirm_polls: int            # e.g. 3 = require 3 polls below trail before exit
+    monitor_min_hold_secs: int            # e.g. 300 = skip first 5 min after entry
+    # Trader-exit signal: if a copied leader sells their side, we exit too.
+    monitor_trader_exit_enabled: bool
+    monitor_trader_exit_window_min: int   # only follow leader sells within last N minutes
+
     # Web dashboard
     dashboard_host: str
     dashboard_port: int
@@ -172,6 +187,16 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_copy_window_secs=_i(values.get("STRATEGY_D_COPY_WINDOW_SECS"), 900),
         strategy_d_num_leaders=_i(values.get("STRATEGY_D_NUM_LEADERS"), 5),
         strategy_d_max_leader_idle_hours=_i(values.get("STRATEGY_D_MAX_LEADER_IDLE_HOURS"), 24),
+        monitor_enabled=_b(values.get("MONITOR_ENABLED"), True),
+        monitor_poll_secs=_i(values.get("MONITOR_POLL_SECS"), 30),
+        monitor_max_loss_pct=_f(values.get("MONITOR_MAX_LOSS_PCT"), 0.50),
+        monitor_timeout_hours=_i(values.get("MONITOR_TIMEOUT_HOURS"), 48),
+        monitor_timeout_min_multiple=_f(values.get("MONITOR_TIMEOUT_MIN_MULTIPLE"), 2.0),
+        monitor_pre_resolution_hours=_f(values.get("MONITOR_PRE_RESOLUTION_HOURS"), 1.0),
+        monitor_confirm_polls=_i(values.get("MONITOR_CONFIRM_POLLS"), 3),
+        monitor_min_hold_secs=_i(values.get("MONITOR_MIN_HOLD_SECS"), 300),
+        monitor_trader_exit_enabled=_b(values.get("MONITOR_TRADER_EXIT_ENABLED"), True),
+        monitor_trader_exit_window_min=_i(values.get("MONITOR_TRADER_EXIT_WINDOW_MIN"), 15),
         dashboard_host=_s(values.get("DASHBOARD_HOST"), "0.0.0.0"),
         dashboard_port=_i(values.get("DASHBOARD_PORT"), 8080),
         dashboard_secret=_s(values.get("DASHBOARD_SECRET"), "changeme"),

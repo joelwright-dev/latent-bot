@@ -20,7 +20,31 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import subprocess
+from pathlib import Path
 from typing import Optional
+
+
+def _git_commit() -> str:
+    """Return the current HEAD commit hash, or 'unknown' if unavailable.
+
+    Read once at process start for the /api/health endpoint. Kept small
+    so deploys can verify the running version.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).parent,
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()[:12]
+    except Exception:
+        pass
+    return "unknown"
+
+
+GIT_COMMIT = _git_commit()
 
 import uvicorn
 from py_clob_client.client import ClobClient
@@ -30,6 +54,7 @@ import config as config_module
 from config import get_config
 from db.database import init_db
 from execution.executor import Executor
+from execution.position_monitor import PositionMonitor
 from execution.settlement import Settlement
 from ingestion.market_seeder import MarketSeeder
 from ingestion.polygon_rpc import PolygonListener
@@ -114,15 +139,18 @@ async def main() -> None:
     graph_builder = GraphBuilder(state, graph)
     executor = Executor(state)
     settlement = Settlement(state, clob=clob)
+    monitor = PositionMonitor(state, clob=clob)
 
     app = create_app(state)
+    app.state.git_commit = GIT_COMMIT
+    log.info("running at commit %s", GIT_COMMIT)
 
     stop_event = asyncio.Event()
 
     def _signal(*_):
         log.info("shutdown signal received")
         stop_event.set()
-        for c in (polygon, ws_in, seeder, reconciler, graph_builder, strat_a, strat_b, strat_c, strat_d, executor, settlement):
+        for c in (polygon, ws_in, seeder, reconciler, graph_builder, strat_a, strat_b, strat_c, strat_d, executor, settlement, monitor):
             try:
                 c.stop()
             except Exception:
@@ -150,6 +178,7 @@ async def main() -> None:
         asyncio.create_task(strat_d.run(),     name="strategy_d"),
         asyncio.create_task(executor.run(),    name="executor"),
         asyncio.create_task(settlement.run(),  name="settlement"),
+        asyncio.create_task(monitor.run(),     name="position_monitor"),
         asyncio.create_task(ws_fanout_loop(app, state), name="ws_fanout"),
         asyncio.create_task(
             _run_web(app, cfg.dashboard_host, cfg.dashboard_port, stop_event),

@@ -46,13 +46,14 @@ class OrderRequest:
     """Structured order candidate produced by a strategy and validated by
     risk.py. Everything executor.py needs to call py-clob-client lives here.
     """
-    strategy: str                # 'A' or 'B'
+    strategy: str                # 'A', 'B', 'C', 'D' (M is reconciler-only)
     token_id: str
-    side: str                    # always 'BUY' for latent-bot
+    side: str                    # 'BUY' (primary) — monitor uses its own SELL path
     limit_price: float           # e.g. 0.97
     size_usdc: float             # principal (not shares)
     time_in_force: str = "GTC"
     memo: Optional[str] = None
+    leader_wallet: Optional[str] = None   # Strategy D: the leader being copied
 
 
 # ---------------------------------------------------------------------------

@@ -152,10 +152,12 @@ class Executor:
             position_id = await db.execute(
                 """INSERT INTO positions
                    (market_token_id, strategy, entry_price, size_usdc,
-                    shares, order_id, tx_hash, status, opened_at, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                    shares, order_id, tx_hash, status, opened_at, notes,
+                    leader_wallet)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
                 (req.token_id, req.strategy, req.limit_price, req.size_usdc,
-                 shares, order_id, tx_hash, int(time.time()), req.memo),
+                 shares, order_id, tx_hash, int(time.time()), req.memo,
+                 req.leader_wallet),
             )
             await open_trade(position_id, req.size_usdc, db=db, memo=req.memo)
         except InsufficientFundsError as e:

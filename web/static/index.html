@@ -372,8 +372,11 @@
         <thead>
           <tr>
             <th>Market</th>
-            <th>Strategy</th>
+            <th>Strat</th>
             <th class="text-right">Entry</th>
+            <th class="text-right">Peak</th>
+            <th class="text-right">Gain ×</th>
+            <th class="text-right">Trail Stop</th>
             <th class="text-right">Size</th>
             <th class="text-right">Shares</th>
             <th>Opened</th>
@@ -383,18 +386,44 @@
         </thead>
         <tbody>
           <tr v-for="p in openPositions" :key="p.id" class="hover:bg-slate-900/40">
-            <td class="max-w-[400px] truncate">{{ p.question || p.market_token_id }}</td>
-            <td><span class="pill" :class="p.strategy === 'A' ? 'bg-sky-900 text-sky-200' : 'bg-violet-900 text-violet-200'">{{ p.strategy }}</span></td>
+            <td class="max-w-[360px] truncate">{{ p.question || p.market_token_id }}</td>
+            <td>
+              <span class="pill" :class="{
+                'bg-sky-900 text-sky-200':     p.strategy === 'A',
+                'bg-violet-900 text-violet-200': p.strategy === 'B',
+                'bg-teal-900 text-teal-200':   p.strategy === 'C',
+                'bg-amber-900 text-amber-200': p.strategy === 'D',
+                'bg-slate-800 text-slate-300': p.strategy === 'M',
+              }">{{ p.strategy }}</span>
+            </td>
             <td class="text-right num">{{ fmt(p.entry_price, 4) }}</td>
+            <td class="text-right num" :class="p.peak_price ? 'text-emerald-300' : 'text-slate-600'">
+              {{ p.peak_price ? fmt(p.peak_price, 4) : '—' }}
+            </td>
+            <td class="text-right num" :class="gainMultClass(p.peak_gain_multiple)">
+              {{ p.peak_gain_multiple ? '×' + fmt(p.peak_gain_multiple, 2) : '—' }}
+            </td>
+            <td class="text-right num text-slate-400">
+              <span v-if="p.trailing_stop_price">
+                {{ fmt(p.trailing_stop_price, 4) }}
+                <span class="text-slate-600 text-xs">({{ fmt(p.trailing_stop_pct * 100, 0) }}%)</span>
+              </span>
+              <span v-else>—</span>
+            </td>
             <td class="text-right num">${{ fmt(p.size_usdc) }}</td>
             <td class="text-right num">{{ fmt(p.shares, 2) }}</td>
             <td class="num">{{ fmtAge(p.opened_at) }}</td>
             <td class="text-right num" :class="estPnl(p) >= 0 ? 'text-emerald-400' : 'text-rose-400'">
               {{ estPnl(p) >= 0 ? '+' : '' }}${{ fmt(estPnl(p)) }}
             </td>
-            <td><span class="pill bg-slate-800 text-slate-300">{{ p.status }}</span></td>
+            <td>
+              <span class="pill" :class="{
+                'bg-slate-800 text-slate-300': p.status === 'open',
+                'bg-amber-800 text-amber-200': p.status === 'awaiting_redeem',
+              }">{{ p.status }}</span>
+            </td>
           </tr>
-          <tr v-if="openPositions.length === 0"><td colspan="8" class="text-center text-slate-500 py-8">No open positions.</td></tr>
+          <tr v-if="openPositions.length === 0"><td colspan="11" class="text-center text-slate-500 py-8">No open positions.</td></tr>
         </tbody>
       </table>
     </section>
@@ -421,7 +450,8 @@
             <tr>
               <th>Settled</th>
               <th>Market</th>
-              <th>Strategy</th>
+              <th>Strat</th>
+              <th>Exit</th>
               <th class="text-right">Entry</th>
               <th class="text-right">Size</th>
               <th class="text-right">Gain</th>
@@ -431,14 +461,23 @@
           <tbody>
             <tr v-for="h in history.rows" :key="h.id">
               <td class="num">{{ fmtDate(h.settled_at) }}</td>
-              <td class="max-w-[400px] truncate">{{ h.question || h.market_token_id }}</td>
-              <td><span class="pill" :class="h.strategy === 'A' ? 'bg-sky-900 text-sky-200' : 'bg-violet-900 text-violet-200'">{{ h.strategy }}</span></td>
+              <td class="max-w-[360px] truncate">{{ h.question || h.market_token_id }}</td>
+              <td>
+                <span class="pill" :class="{
+                  'bg-sky-900 text-sky-200':     h.strategy === 'A',
+                  'bg-violet-900 text-violet-200': h.strategy === 'B',
+                  'bg-teal-900 text-teal-200':   h.strategy === 'C',
+                  'bg-amber-900 text-amber-200': h.strategy === 'D',
+                  'bg-slate-800 text-slate-300': h.strategy === 'M',
+                }">{{ h.strategy }}</span>
+              </td>
+              <td class="text-xs text-slate-400">{{ h.exit_reason || '—' }}</td>
               <td class="text-right num">{{ fmt(h.entry_price, 4) }}</td>
               <td class="text-right num">${{ fmt(h.size_usdc) }}</td>
               <td class="text-right num" :class="(h.gain_usdc || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'">${{ fmt(h.gain_usdc) }}</td>
               <td class="text-right num">{{ fmt((h.gain_usdc || 0) / (h.size_usdc || 1) * 100, 2) }}%</td>
             </tr>
-            <tr v-if="history.rows?.length === 0"><td colspan="7" class="text-center text-slate-500 py-8">No trades match this filter.</td></tr>
+            <tr v-if="history.rows?.length === 0"><td colspan="8" class="text-center text-slate-500 py-8">No trades match this filter.</td></tr>
           </tbody>
         </table>
       </div>
@@ -604,6 +643,14 @@ createApp({
       if (s < 3600)   return `${Math.floor(s/60)}m`;
       if (s < 86400)  return `${Math.floor(s/3600)}h`;
       return `${Math.floor(s/86400)}d`;
+    };
+    const gainMultClass = (m) => {
+      if (!m) return 'text-slate-600';
+      if (m >= 20) return 'text-emerald-400 font-semibold';
+      if (m >= 5)  return 'text-emerald-400';
+      if (m >= 2)  return 'text-emerald-300';
+      if (m >= 1)  return 'text-slate-300';
+      return 'text-rose-400';
     };
     const askClass = (ask) => {
       if (!ask) return 'text-slate-500';
@@ -871,7 +918,7 @@ createApp({
       tab, tabs, secret, saveSecret, status, pools, stats, config, draft, ledger,
       events, openPositions, history, historyFilter, withdrawAmount,
       upcoming, upcomingFilter, loadUpcoming, setPreset,
-      wouldBuy, whyNot, matchCount,
+      wouldBuy, whyNot, matchCount, gainMultClass,
       graphEl, graphFilter, graphMeta, loadGraph,
       leaders, leadersMeta, loadLeaders, fmtAgeDelta,
       portfolio, loadPortfolio,

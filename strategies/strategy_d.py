@@ -365,6 +365,7 @@ class StrategyD:
             limit_price=round(current_ask, 4),
             size_usdc=round(size, 2),
             memo=f"strategy_d copy {leader.pseudonym[:16]}@{their_price:.3f} ({outcome})",
+            leader_wallet=leader.wallet,
         )
         lag_secs = int(time.time()) - trade_ts
         await self.state.db.log_event(

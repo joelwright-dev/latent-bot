@@ -1,0 +1,30 @@
+[Unit]
+Description=latent-bot Polymarket copy-trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Template placeholders filled in by deploy/install.sh — don't edit
+# this file by hand, rerun the installer instead.
+User=__USER__
+Group=__USER__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=-__INSTALL_DIR__/.env
+ExecStart=__INSTALL_DIR__/venv/bin/python __INSTALL_DIR__/main.py
+Restart=always
+RestartSec=10
+# Allow unlimited restart attempts — transient network blips shouldn't
+# ever cause systemd to give up on the service.
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=latent-bot
+
+# Soft resource caps — the Pi isn't going to OOM on this workload, but
+# if something goes rogue we don't want it eating the whole box.
+MemoryMax=512M
+CPUQuota=90%
+
+[Install]
+WantedBy=multi-user.target
