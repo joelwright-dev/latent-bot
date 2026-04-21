@@ -80,16 +80,24 @@ def main() -> int:
     except Exception as e:
         print(f"  ! collateral approval skipped/failed: {e}")
 
-    print("Setting CTF (conditional tokens) allowance...")
-    try:
-        resp = fn(BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL))
-        print(f"  ✓ {resp}")
-    except Exception as e:
-        print(f"  ! conditional approval skipped/failed: {e}")
+    # NOTE: the CTF (ERC-1155) approval can't be done through this API —
+    # it needs `setApprovalForAll` at the contract level, which
+    # Polymarket sets automatically when you create an account via their
+    # web UI. For proxy wallets (signature_type=1) this is always
+    # already in place, so we skip it. Raw MetaMask signups may need
+    # to approve manually through polymarket.com once before trading.
+    if cfg.signature_type == 1:
+        print()
+        print("Skipping CTF allowance check — Polymarket web-signup proxy")
+        print("wallets (signature_type=1) already have CTF approval set.")
+    else:
+        print()
+        print("CTF approval not performed via this script.")
+        print("If your first trade fails with an ERC-1155 error, approve")
+        print("CTF spending manually at polymarket.com.")
 
     print()
-    print("Done. If both calls succeeded (or were skipped because already")
-    print("approved), you should be able to trade. First trade will confirm.")
+    print("Done. You should be able to trade — first trade will confirm.")
     return 0
 
 
