@@ -75,6 +75,9 @@ class Config:
     strategy_d_num_leaders: int           # how many top traders to follow
     strategy_d_max_leader_idle_hours: int # drop a leader if no trades in this window
     strategy_d_max_entry_price: float     # skip buys above this price (limits risk/reward ratio)
+    strategy_d_min_entry_price: float     # skip buys below this price (avoid cheap longshots with 0% win rate)
+    strategy_d_leader_min_trades: int     # min settled copies before judging a leader
+    strategy_d_leader_min_win_rate: float # blocklist leaders with win% below this after min_trades
 
     # PositionMonitor (auto-exit logic for Strategy D copy trades)
     monitor_enabled: bool
@@ -189,6 +192,9 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_num_leaders=_i(values.get("STRATEGY_D_NUM_LEADERS"), 5),
         strategy_d_max_leader_idle_hours=_i(values.get("STRATEGY_D_MAX_LEADER_IDLE_HOURS"), 24),
         strategy_d_max_entry_price=_f(values.get("STRATEGY_D_MAX_ENTRY_PRICE"), 0.95),
+        strategy_d_min_entry_price=_f(values.get("STRATEGY_D_MIN_ENTRY_PRICE"), 0.0),
+        strategy_d_leader_min_trades=_i(values.get("STRATEGY_D_LEADER_MIN_TRADES"), 10),
+        strategy_d_leader_min_win_rate=_f(values.get("STRATEGY_D_LEADER_MIN_WIN_RATE"), 0.30),
         monitor_enabled=_b(values.get("MONITOR_ENABLED"), True),
         monitor_poll_secs=_i(values.get("MONITOR_POLL_SECS"), 30),
         monitor_max_loss_pct=_f(values.get("MONITOR_MAX_LOSS_PCT"), 0.50),

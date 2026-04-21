@@ -64,6 +64,11 @@ class StrategyD:
         self._pending_usdc = 0.0
         self._pending_lock = asyncio.Lock()
         self._pending_hold_secs = 5.0
+        # Per-leader blocklist cache: {wallet: (blocked_bool, ts)}. Refreshed
+        # every LEADER_EVAL_TTL_SECS so we don't hammer the DB on every
+        # copy consideration.
+        self._leader_verdict: dict[str, tuple[bool, float]] = {}
+        self._leader_eval_ttl = 600.0  # 10 min
 
     async def run(self) -> None:
         self._running = True
@@ -309,6 +314,37 @@ class StrategyD:
             )
             return
 
+        # Hard floor on entry price. Leaders buying longshots (<$0.25) on
+        # copy showed 0% win rate in our historical data — the leader's
+        # edge doesn't transfer because we fill late at a worse price and
+        # the tokens are high-variance. Set via STRATEGY_D_MIN_ENTRY_PRICE.
+        if current_ask < cfg.strategy_d_min_entry_price:
+            await self.state.db.log_event(
+                "info", "strategy_d",
+                f"skip (entry {current_ask:.4f} < floor {cfg.strategy_d_min_entry_price:.4f}) "
+                f"from {leader.pseudonym}: {title[:60]} [{outcome}]",
+                {"leader": leader.wallet, "token_id": token_id,
+                 "current_ask": current_ask,
+                 "min_entry_price": cfg.strategy_d_min_entry_price,
+                 "title": title, "outcome": outcome},
+            )
+            return
+
+        # Leader quality gate: skip leaders with proven-bad copy P&L.
+        # Uses our own settled positions to judge — the weekly leaderboard
+        # shows who's winning on Polymarket, but what matters is who's
+        # winning WHEN WE COPY. A leader can be up $50k personally but
+        # -$12 on our copies because their edge is in markets/timing we
+        # can't replicate. See strategy_d_leader_min_trades/win_rate.
+        if await self._leader_blocked(leader.wallet, cfg):
+            await self.state.db.log_event(
+                "info", "strategy_d",
+                f"skip (leader blocked by copy performance) from {leader.pseudonym}: "
+                f"{title[:60]} [{outcome}]",
+                {"leader": leader.wallet, "token_id": token_id},
+            )
+            return
+
         # Dual cap: use the LOOSER of percentage or absolute. Percentage
         # works for expensive positions ($0.97 → 3% is $0.029); absolute
         # works for cheap positions (where 10% of $0.06 = half a cent but
@@ -409,3 +445,41 @@ class StrategyD:
         await asyncio.sleep(self._pending_hold_secs)
         async with self._pending_lock:
             self._pending_usdc = max(0.0, self._pending_usdc - reserved)
+
+    async def _leader_blocked(self, wallet: str, cfg) -> bool:
+        """Return True if this leader's recent copy P&L disqualifies them.
+
+        Judged on OUR settled positions, not the weekly leaderboard. A
+        leader with fewer than `leader_min_trades` settled copies gets
+        the benefit of the doubt (returns False). Once the sample is
+        large enough, we block if win rate falls below `leader_min_win_rate`.
+        Results cached for `_leader_eval_ttl` to avoid per-tick DB load.
+        """
+        now = time.time()
+        cached = self._leader_verdict.get(wallet)
+        if cached and (now - cached[1]) < self._leader_eval_ttl:
+            return cached[0]
+
+        row = await self.state.db.fetchone(
+            "SELECT COUNT(*) AS n, "
+            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       COALESCE(SUM(gain_usdc), 0) AS total_gain "
+            "FROM positions "
+            "WHERE leader_wallet = ? AND strategy = 'D' AND status = 'settled'",
+            (wallet,),
+        )
+        n = int(row["n"] or 0) if row else 0
+        wins = int(row["wins"] or 0) if row else 0
+        total_gain = float(row["total_gain"] or 0) if row else 0.0
+
+        blocked = False
+        if n >= cfg.strategy_d_leader_min_trades:
+            win_rate = wins / n if n > 0 else 0.0
+            # Block if win rate too low AND we're losing money on them.
+            # The "AND losing" clause prevents blocking leaders with 28%
+            # win rate but big winners that net positive.
+            if win_rate < cfg.strategy_d_leader_min_win_rate and total_gain < 0:
+                blocked = True
+
+        self._leader_verdict[wallet] = (blocked, now)
+        return blocked

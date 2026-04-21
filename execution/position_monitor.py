@@ -52,6 +52,8 @@ def _trailing_threshold(gain_multiple: float) -> float:
     """Return the trailing stop % for a given gain multiple.
 
     Tighter thresholds at higher gains because there's more to lose.
+    Low-gain tier is wide because copies on volatile markets need room —
+    firing at 40% was bailing on normal noise; 55% lets winners breathe.
     """
     if gain_multiple >= 50:
         return 0.10
@@ -59,7 +61,14 @@ def _trailing_threshold(gain_multiple: float) -> float:
         return 0.15
     if gain_multiple >= 5:
         return 0.25
-    return 0.40
+    return 0.55
+
+
+# Trailing only activates once peak_price has been at least this multiple
+# of entry. Old value was 1.10 — too low, trailing kept firing on normal
+# post-entry volatility before any real profit accrued. 1.5 means the
+# position must have run up at least 50% before we start protecting gain.
+TRAILING_ACTIVATION_GAIN = 1.5
 
 
 class PositionMonitor:
@@ -192,7 +201,7 @@ class PositionMonitor:
         threshold = _trailing_threshold(gain_multiple)
         trailing_line = peak * (1.0 - threshold)
         peak_gain = peak / entry
-        if peak_gain >= 1.10 and current < trailing_line:
+        if peak_gain >= TRAILING_ACTIVATION_GAIN and current < trailing_line:
             self._dip_counts[pos_id] = self._dip_counts.get(pos_id, 0) + 1
             if self._dip_counts[pos_id] >= cfg.monitor_confirm_polls:
                 await self._fire_exit(
