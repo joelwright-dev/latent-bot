@@ -137,35 +137,40 @@ class Database:
             elif target == 9:
                 # v8 -> v9: add Polymarket snapshot columns for
                 # reconciler-driven auto-settlement.
+                # Skip entirely on a fresh install where `positions`
+                # doesn't exist yet — schema.sql runs right after the
+                # migrations and creates it with all columns already.
                 cur9 = await self._conn.execute("PRAGMA table_info(positions)")
                 cols = [r[1] for r in await cur9.fetchall()]
-                for col, typ in (
-                    ("pm_last_value",      "REAL"),
-                    ("pm_last_cash_pnl",   "REAL"),
-                    ("pm_last_redeemable", "INTEGER"),
-                    ("pm_last_sync_at",    "INTEGER"),
-                ):
-                    if col not in cols:
-                        await self._conn.execute(
-                            f"ALTER TABLE positions ADD COLUMN {col} {typ}"
-                        )
+                if cols:
+                    for col, typ in (
+                        ("pm_last_value",      "REAL"),
+                        ("pm_last_cash_pnl",   "REAL"),
+                        ("pm_last_redeemable", "INTEGER"),
+                        ("pm_last_sync_at",    "INTEGER"),
+                    ):
+                        if col not in cols:
+                            await self._conn.execute(
+                                f"ALTER TABLE positions ADD COLUMN {col} {typ}"
+                            )
             elif target == 10:
                 # v9 -> v10: PositionMonitor fields.
                 cur10 = await self._conn.execute("PRAGMA table_info(positions)")
                 cols = [r[1] for r in await cur10.fetchall()]
-                for col, typ in (
-                    ("peak_price",  "REAL"),
-                    ("exit_reason", "TEXT"),
-                ):
-                    if col not in cols:
-                        await self._conn.execute(
-                            f"ALTER TABLE positions ADD COLUMN {col} {typ}"
-                        )
+                if cols:
+                    for col, typ in (
+                        ("peak_price",  "REAL"),
+                        ("exit_reason", "TEXT"),
+                    ):
+                        if col not in cols:
+                            await self._conn.execute(
+                                f"ALTER TABLE positions ADD COLUMN {col} {typ}"
+                            )
             elif target == 11:
                 # v10 -> v11: leader_wallet for trader-exit signal.
                 cur11 = await self._conn.execute("PRAGMA table_info(positions)")
                 cols = [r[1] for r in await cur11.fetchall()]
-                if "leader_wallet" not in cols:
+                if cols and "leader_wallet" not in cols:
                     await self._conn.execute(
                         "ALTER TABLE positions ADD COLUMN leader_wallet TEXT"
                     )
