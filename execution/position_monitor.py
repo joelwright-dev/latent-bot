@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Optional
 
@@ -518,10 +519,14 @@ class PositionMonitor:
         it fills at a better price; if it moves against us the order
         rests and the reconciler cleans up.
         """
+        # Floor instead of round so we never ask for more shares than we
+        # actually hold. Polymarket tracks balances at 6-decimal USDC
+        # precision; standard rounding on a balance like 22.46788 gives
+        # 22.47 which is 0.00212 over the real balance → rejected order.
         args = OrderArgs(
             token_id=token_id,
             price=round(limit_price, 4),
-            size=round(shares, 2),
+            size=math.floor(shares * 100) / 100,
             side="SELL",
         )
         signed = self._clob.create_order(args)

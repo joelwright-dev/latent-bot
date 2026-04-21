@@ -120,15 +120,133 @@ async def main() -> None:
     for r in rows:
         print(f"  {ts(r['timestamp'])}  [{r['source']}]  {r['message']}")
 
+    # ---- Strategy D performance breakdowns ----
+    print("\n" + "=" * 70)
+    print("STRATEGY D PERFORMANCE")
+    print("=" * 70)
+
+    print("\nP&L by strategy (settled only):")
+    rows = await db.fetchall(
+        "SELECT strategy, COUNT(*) AS n, "
+        "       ROUND(SUM(size_usdc), 2) AS principal, "
+        "       ROUND(SUM(gain_usdc), 2) AS total_gain, "
+        "       ROUND(AVG(gain_usdc), 3) AS avg_gain, "
+        "       ROUND(SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) AS win_pct "
+        "FROM positions WHERE status = 'settled' AND strategy IN ('A','B','C','D') "
+        "GROUP BY strategy"
+    )
+    if not rows:
+        print("  (no settled positions)")
+    for r in rows:
+        print(f"  {r['strategy']}  n={r['n']:<4}  principal=${r['principal']:<8}  "
+              f"total_gain=${r['total_gain']:<8}  avg=${r['avg_gain']:<8}  "
+              f"win%={r['win_pct']}")
+
+    print("\nP&L by exit reason (D only):")
+    rows = await db.fetchall(
+        "SELECT COALESCE(exit_reason, 'n/a') AS reason, COUNT(*) AS n, "
+        "       ROUND(SUM(gain_usdc), 2) AS total_gain, "
+        "       ROUND(AVG(gain_usdc), 3) AS avg_gain, "
+        "       ROUND(MIN(gain_usdc), 2) AS worst, "
+        "       ROUND(MAX(gain_usdc), 2) AS best "
+        "FROM positions WHERE status = 'settled' AND strategy = 'D' "
+        "GROUP BY reason ORDER BY total_gain"
+    )
+    if not rows:
+        print("  (none)")
+    for r in rows:
+        print(f"  {r['reason']:<18}  n={r['n']:<4}  total=${r['total_gain']:<8}  "
+              f"avg=${r['avg_gain']:<8}  worst=${r['worst']:<7}  best=${r['best']}")
+
+    print("\nP&L by leader (D only):")
+    rows = await db.fetchall(
+        "SELECT SUBSTR(COALESCE(leader_wallet, 'unknown'), 1, 12) AS leader, "
+        "       COUNT(*) AS n, "
+        "       ROUND(SUM(gain_usdc), 2) AS total_gain, "
+        "       ROUND(AVG(gain_usdc), 3) AS avg_gain, "
+        "       ROUND(SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) AS win_pct "
+        "FROM positions WHERE status = 'settled' AND strategy = 'D' "
+        "GROUP BY leader_wallet ORDER BY total_gain"
+    )
+    if not rows:
+        print("  (none)")
+    for r in rows:
+        print(f"  {r['leader']:<14}  n={r['n']:<4}  total=${r['total_gain']:<8}  "
+              f"avg=${r['avg_gain']:<8}  win%={r['win_pct']}")
+
+    print("\nP&L by entry price bucket (D only):")
+    rows = await db.fetchall(
+        "SELECT CASE "
+        "         WHEN entry_price < 0.10 THEN '0.00-0.10' "
+        "         WHEN entry_price < 0.25 THEN '0.10-0.25' "
+        "         WHEN entry_price < 0.50 THEN '0.25-0.50' "
+        "         WHEN entry_price < 0.75 THEN '0.50-0.75' "
+        "         ELSE '0.75+' END AS bucket, "
+        "       COUNT(*) AS n, "
+        "       ROUND(SUM(gain_usdc), 2) AS total_gain, "
+        "       ROUND(AVG(gain_usdc), 3) AS avg_gain, "
+        "       ROUND(SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) AS win_pct "
+        "FROM positions WHERE status = 'settled' AND strategy = 'D' "
+        "GROUP BY bucket ORDER BY bucket"
+    )
+    if not rows:
+        print("  (none)")
+    for r in rows:
+        print(f"  {r['bucket']:<12}  n={r['n']:<4}  total=${r['total_gain']:<8}  "
+              f"avg=${r['avg_gain']:<8}  win%={r['win_pct']}")
+
+    print("\nHold time by outcome (D only, minutes):")
+    rows = await db.fetchall(
+        "SELECT CASE WHEN gain_usdc > 0 THEN 'WIN' ELSE 'LOSS' END AS outcome, "
+        "       COALESCE(exit_reason, 'n/a') AS reason, "
+        "       COUNT(*) AS n, "
+        "       ROUND(AVG((settled_at - opened_at) / 60.0), 1) AS avg_mins, "
+        "       ROUND(AVG(gain_usdc), 3) AS avg_gain "
+        "FROM positions WHERE status = 'settled' AND strategy = 'D' "
+        "AND settled_at IS NOT NULL "
+        "GROUP BY outcome, reason ORDER BY outcome, avg_mins"
+    )
+    if not rows:
+        print("  (none)")
+    for r in rows:
+        print(f"  {r['outcome']:<5} {r['reason']:<18}  n={r['n']:<4}  "
+              f"avg_mins={r['avg_mins']:<7}  avg_gain=${r['avg_gain']}")
+
+    print("\nLast 30 settled D positions:")
+    rows = await db.fetchall(
+        "SELECT id, SUBSTR(COALESCE(leader_wallet, 'n/a'), 1, 10) AS leader, "
+        "       entry_price, size_usdc, gain_usdc, exit_reason, "
+        "       (settled_at - opened_at) / 60 AS mins "
+        "FROM positions WHERE status = 'settled' AND strategy = 'D' "
+        "ORDER BY id DESC LIMIT 30"
+    )
+    for r in rows:
+        gain = r['gain_usdc'] if r['gain_usdc'] is not None else 0
+        print(f"  #{r['id']:<4} {r['leader']:<12} entry={r['entry_price']:.3f} "
+              f"princ=${r['size_usdc']:.2f} gain=${gain:+.2f} "
+              f"reason={r['exit_reason'] or '—':<15} mins={r['mins']}")
+
     # ---- config snapshot ----
+    print("\n" + "=" * 70)
+    print("CONFIG SNAPSHOT")
+    print("=" * 70)
     print("\nactive config (non-sensitive):")
     for field in ("strategy_a_enabled", "strategy_a_deploy_rate",
                   "strategy_a_max_concurrent", "strategy_a_bid_price",
                   "strategy_b_enabled", "strategy_b_deploy_rate",
                   "strategy_b_max_position", "strategy_b_bid_price",
+                  "strategy_d_enabled", "strategy_d_deploy_rate",
+                  "strategy_d_max_position", "strategy_d_max_entry_price",
+                  "strategy_d_max_price_slippage", "strategy_d_max_price_slippage_abs",
+                  "strategy_d_copy_window_secs", "strategy_d_num_leaders",
+                  "monitor_enabled", "monitor_max_loss_pct",
+                  "monitor_timeout_hours", "monitor_timeout_min_multiple",
+                  "monitor_confirm_polls", "monitor_min_hold_secs",
+                  "monitor_trader_exit_enabled",
                   "gain_pool_split", "min_order_size",
                   "trading_pool_pause_threshold"):
-        print(f"  {field:<32} = {getattr(cfg, field)}")
+        val = getattr(cfg, field, "(not set)")
+        print(f"  {field:<36} = {val}")
 
     await db.close()
     print("\n" + "=" * 70)
