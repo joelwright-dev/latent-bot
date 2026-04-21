@@ -34,7 +34,8 @@ sudo apt-get install -y \
     python3 python3-pip python3-venv \
     git curl \
     build-essential libssl-dev libffi-dev \
-    sqlite3
+    sqlite3 \
+    ufw
 
 # ---------------------------------------------------------------------------
 log "cloning/updating repo to $INSTALL_DIR"
