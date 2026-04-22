@@ -377,6 +377,15 @@ def create_app(state: StateManager) -> FastAPI:
     # ------------------------------------------------------------------
     # POST /api/bot/toggle — master kill switch (pauses all strategies + monitor)
     # ------------------------------------------------------------------
+    @app.post("/api/strategy-d/refresh-leaders", dependencies=[Depends(require_auth)])
+    async def refresh_d_leaders() -> dict:
+        """Force an immediate Strategy D leader roster refresh.
+        Next poll cycle (up to strategy_d_poll_secs) will reload the
+        top-N leaders and apply the current config (window, num_leaders,
+        min_history, etc.)."""
+        state.d_force_refresh = True
+        return {"ok": True, "note": "will refresh within 1 poll interval"}
+
     @app.post("/api/bot/toggle", dependencies=[Depends(require_auth)])
     async def toggle_bot(body: dict) -> dict:
         enabled = bool(body.get("enabled"))
@@ -841,18 +850,23 @@ def create_app(state: StateManager) -> FastAPI:
                 "note": "Strategy D hasn't run a refresh yet — enable it in config and wait ~1 minute",
             }
 
-        # Fetch each leader's recent trades in parallel.
+        # Fetch each leader's recent trades in parallel. Use /activity
+        # (fresh) not /trades (2h+ lagged). Filter to type=TRADE to
+        # skip REWARD/REBATE entries.
         async def _fetch(session, wallet: str) -> list[dict]:
             try:
                 async with session.get(
-                    "https://data-api.polymarket.com/trades",
-                    params={"user": wallet, "limit": str(trades_per_leader)},
+                    "https://data-api.polymarket.com/activity",
+                    params={"user": wallet,
+                            "limit": str(max(trades_per_leader * 3, 50))},
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as r:
                     if r.status != 200:
                         return []
                     data = await r.json()
-                return data if isinstance(data, list) else []
+                entries = data if isinstance(data, list) else []
+                trades = [e for e in entries if (e.get("type") or "").upper() == "TRADE"]
+                return trades[:trades_per_leader]
             except Exception:
                 return []
 

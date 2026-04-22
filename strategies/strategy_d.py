@@ -35,7 +35,11 @@ from ingestion.state_manager import Signal, SignalKind, StateManager
 log = logging.getLogger(__name__)
 
 LEADERBOARD_URL = "https://lb-api.polymarket.com/profit"
-TRADES_URL = "https://data-api.polymarket.com/trades"
+# NOTE: We use /activity (not /trades) because /trades lags 2+ hours
+# behind the actual Polymarket orderbook, making real-time copy trading
+# impossible. /activity is updated in near-real-time. We filter to
+# type=TRADE client-side to skip REWARD/REBATE events.
+ACTIVITY_URL = "https://data-api.polymarket.com/activity"
 
 LEADER_REFRESH_SECS = 3600  # re-check the leaderboard every hour
 
@@ -117,10 +121,17 @@ class StrategyD:
             # Leader refresh runs unconditionally on its own cadence so
             # the "Leaders" dashboard tab keeps updating even if we're
             # not actively copying (STRATEGY_D_ENABLED=false).
+            # Also honours `state.d_force_refresh` — a one-shot flag set
+            # by the dashboard to trigger an immediate reload after a
+            # config change (num_leaders, leaderboard_window, etc.).
             try:
-                if time.time() - self._last_leader_refresh > LEADER_REFRESH_SECS:
+                force = getattr(self.state, "d_force_refresh", False)
+                due = time.time() - self._last_leader_refresh > LEADER_REFRESH_SECS
+                if force or due:
                     await self._refresh_leaders(cfg)
                     self._last_leader_refresh = time.time()
+                    if force:
+                        self.state.d_force_refresh = False
             except Exception:
                 log.exception("leader refresh failed")
 
@@ -353,23 +364,32 @@ class StrategyD:
     async def _fetch_recent_trades(
         self, user: str, limit: int = 20,
     ) -> list[dict]:
+        """Fetch recent TRADE activity for a user. Uses /activity because
+        /trades runs hours behind real-time; /activity is fresh.
+
+        We over-fetch then filter to type=TRADE because /activity also
+        returns REWARD / MAKER_REBATE entries we don't want to copy.
+        """
         timeout = aiohttp.ClientTimeout(total=15)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 async with s.get(
-                    TRADES_URL,
-                    params={"user": user, "limit": str(limit)},
+                    ACTIVITY_URL,
+                    # Over-fetch to have enough TRADE entries after filtering.
+                    params={"user": user, "limit": str(max(limit * 3, 50))},
                 ) as r:
                     if r.status != 200:
                         return []
                     data = await r.json()
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict) and "data" in data:
-                return data["data"]
-            return []
         except Exception:
             return []
+
+        entries = data if isinstance(data, list) else (
+            data.get("data") if isinstance(data, dict) else None
+        ) or []
+        # Keep only actual trades; drop rewards/rebates/redeems/etc.
+        trades = [e for e in entries if (e.get("type") or "").upper() == "TRADE"]
+        return trades[:limit]
 
     # ------------------------------------------------------------------
     # Copy decision

@@ -36,7 +36,8 @@ from db.database import init_db
 
 
 LEADERBOARD_URL = "https://lb-api.polymarket.com/profit"
-TRADES_URL = "https://data-api.polymarket.com/trades"
+# /activity (fresh) instead of /trades (lags 2h+ behind real-time)
+ACTIVITY_URL = "https://data-api.polymarket.com/activity"
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 
 log = logging.getLogger("backtest")
@@ -98,17 +99,23 @@ async def fetch_leaderboard(limit: int, window: str) -> list[dict]:
 
 
 async def fetch_user_trades(wallet: str, limit: int = 500) -> list[dict]:
+    """Fetch up to `limit` TRADE activity entries for a user. Over-fetches
+    from /activity (which also includes REWARD/REBATE) and filters to TRADE
+    client-side. /activity is used instead of /trades because /trades is
+    2h+ stale vs real-time."""
+    # Over-fetch because only a fraction of activity is TRADE.
+    fetch_limit = max(limit * 3, 100)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
-        async with s.get(TRADES_URL, params={"user": wallet, "limit": str(limit)}) as r:
+        async with s.get(ACTIVITY_URL, params={"user": wallet, "limit": str(fetch_limit)}) as r:
             if r.status != 200:
-                log.warning("trades HTTP %d for %s", r.status, wallet[:10])
+                log.warning("activity HTTP %d for %s", r.status, wallet[:10])
                 return []
             data = await r.json()
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return data.get("data") or []
-    return []
+    entries = data if isinstance(data, list) else (
+        data.get("data") if isinstance(data, dict) else []
+    ) or []
+    trades = [e for e in entries if (e.get("type") or "").upper() == "TRADE"]
+    return trades[:limit]
 
 
 def _trade_size_usdc(t: dict) -> float:

@@ -85,6 +85,12 @@ class StateManager:
         # a single, stable place to look.
         self.d_leaders: list[dict] = []
         self.d_leaders_refreshed_at: Optional[float] = None
+        # When set true, StrategyD's next tick will refresh the leaderboard
+        # roster on the next cycle (bypassing the hourly cadence). Cleared
+        # by StrategyD after the refresh completes. Lets the dashboard
+        # trigger an immediate roster reload after a config change
+        # (num_leaders, leaderboard_window, etc.).
+        self.d_force_refresh: bool = False
 
     # ------------------------------------------------------------------
     # Boot

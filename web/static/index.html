@@ -293,7 +293,12 @@
             last refreshed {{ fmtAge(Math.floor(leadersMeta.refreshed_at)) }} ago
           </span>
         </div>
-        <button class="btn ml-auto" @click="loadLeaders">refresh</button>
+        <button class="btn ml-auto" @click="loadLeaders" title="Re-read current roster from dashboard API">refresh view</button>
+        <button class="btn" @click="forceRefreshDLeaders"
+          title="Tells Strategy D to rebuild its roster from Polymarket using current config (num_leaders, window, etc.). Takes ~1 poll interval.">
+          🔄 rebuild roster
+        </button>
+        <span v-if="rosterRefreshMsg" class="text-xs text-emerald-400">{{ rosterRefreshMsg }}</span>
       </div>
       <div v-if="leaders.length === 0" class="card p-6 text-center text-slate-500">
         {{ leadersMeta.note || 'No leaders loaded yet.' }}
@@ -839,17 +844,26 @@
 
     <!-- CONFIG -->
     <section v-if="tab === 'config'" class="space-y-4">
-      <!-- Config presets -->
+      <!-- Primary save bar — sticky at top so it's always reachable -->
+      <div class="card p-3 sm:p-4 flex flex-wrap items-center gap-3 sticky top-0 z-10 bg-slate-950 border-slate-700">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Live Config</div>
+        <button class="btn btn-pri" @click="saveConfig">💾 Save Config</button>
+        <span v-if="pendingCount > 0" class="text-xs text-amber-400">{{ pendingCount }} unsaved change{{ pendingCount === 1 ? '' : 's' }}</span>
+        <span v-if="saveMsg" class="text-xs font-semibold" :class="saveMsg.startsWith('✓') ? 'text-emerald-400' : 'text-rose-400'">{{ saveMsg }}</span>
+        <span class="text-xs text-slate-500 ml-auto">Changes to leaderboard window or # leaders take effect on the next hourly refresh</span>
+      </div>
+
+      <!-- Preset management (separate, not to be confused with live save) -->
       <div class="card p-3 sm:p-4 flex flex-wrap items-center gap-2">
-        <div class="text-xs text-slate-500 uppercase tracking-wider mr-2">Presets</div>
+        <div class="text-xs text-slate-500 uppercase tracking-wider mr-2">Presets (snapshots)</div>
         <select class="input" v-model="presetSelected">
           <option value="">— load preset —</option>
           <option v-for="p in presetsLive" :key="p.id" :value="p.id">{{ p.name }}</option>
         </select>
-        <button class="btn" @click="applyPreset(presetSelected)" :disabled="!presetSelected">Load</button>
+        <button class="btn" @click="applyPreset(presetSelected)" :disabled="!presetSelected">Apply to Live</button>
         <button class="btn" @click="deletePreset(presetSelected)" :disabled="!presetSelected">Delete</button>
         <input class="input" placeholder="new preset name" v-model="presetNewName" style="width: 180px" />
-        <button class="btn btn-pri" @click="savePreset('live')" :disabled="!presetNewName">Save current</button>
+        <button class="btn" @click="savePreset('live')" :disabled="!presetNewName">Save as preset</button>
         <span v-if="presetMsg" class="text-xs text-emerald-400">{{ presetMsg }}</span>
       </div>
 
@@ -1093,6 +1107,7 @@ createApp({
     const presetNewName = ref('');
     const presetMsg = ref('');
     const saveMsg = ref('');
+    const rosterRefreshMsg = ref('');
 
     // Backtest state
     const btPresetSelected = ref('');
@@ -1264,6 +1279,18 @@ createApp({
       } catch (e) { /* ignore */ }
     };
 
+    const forceRefreshDLeaders = async () => {
+      try {
+        await postJson('/api/strategy-d/refresh-leaders', {});
+        rosterRefreshMsg.value = '✓ refresh queued — leaders will update within ~1 min';
+        setTimeout(() => rosterRefreshMsg.value = '', 5000);
+        // Auto-reload the view a bit later so the new roster shows up.
+        setTimeout(() => loadLeaders(), 65000);
+      } catch (e) {
+        rosterRefreshMsg.value = '✗ ' + e.message;
+      }
+    };
+
     const loadGraph = async () => {
       const qs = new URLSearchParams({
         hours: graphFilter.hours,
@@ -1357,23 +1384,50 @@ createApp({
       'db_path', 'signature_type', 'dashboard_host', 'dashboard_port',
     ]);
 
-    const saveConfig = async () => {
-      // Build payload from all editable draft keys. Any key whose value
-      // is a string/number/bool becomes an env var via upper-case conversion.
-      const payload = {};
+    // Compute which draft keys differ from live config — used both to build
+    // the save payload and to show the "N unsaved changes" indicator.
+    const diffKeys = () => {
+      const changed = [];
       for (const [k, v] of Object.entries(draft)) {
         if (v === undefined || v === null) continue;
         if (SENSITIVE_FIELDS.has(k)) continue;
-        payload[k.toUpperCase()] = v;
+        // Compare loosely to handle number/string inputs.
+        const cur = config[k];
+        if (cur === undefined) {
+          changed.push(k);
+        } else if (typeof v === 'boolean' || typeof cur === 'boolean') {
+          if (Boolean(v) !== Boolean(cur)) changed.push(k);
+        } else if (Number(v) !== Number(cur) && String(v) !== String(cur)) {
+          changed.push(k);
+        }
+      }
+      return changed;
+    };
+
+    const pendingCount = computed(() => diffKeys().length);
+
+    const saveConfig = async () => {
+      const changed = diffKeys();
+      if (changed.length === 0) {
+        saveMsg.value = 'no changes to save';
+        setTimeout(() => saveMsg.value = '', 2000);
+        return;
+      }
+      const payload = {};
+      for (const k of changed) {
+        payload[k.toUpperCase()] = draft[k];
       }
       try {
         await postJson('/api/config', payload);
         localStorage.setItem('latentbot.secret', secret.value);
-        saveMsg.value = '✓ saved';
-        setTimeout(() => saveMsg.value = '', 2000);
+        saveMsg.value = `✓ saved ${changed.length} change${changed.length === 1 ? '' : 's'}`;
+        setTimeout(() => saveMsg.value = '', 3000);
         await refreshAll();
       } catch (e) {
-        saveMsg.value = '✗ ' + e.message;
+        // Surface the specific backend error so a field that fails
+        // validation is obvious (e.g. "STRATEGY_A_DEPLOY_RATE must be in (0, 1]")
+        const msg = String(e.message || e).slice(0, 200);
+        saveMsg.value = '✗ ' + msg;
       }
     };
 
@@ -1575,11 +1629,12 @@ createApp({
       graphEl, graphFilter, graphMeta, loadGraph,
       leaders, leadersMeta, loadLeaders, fmtAgeDelta,
       dStats, loadStrategyDStats,
+      forceRefreshDLeaders, rosterRefreshMsg,
       portfolio, loadPortfolio,
       fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl,
       loadHistory, saveConfig, toggleStrategy, toggleBot, withdraw,
       presetsLive, presetsBacktest, presetSelected, presetNewName, presetMsg,
-      savePreset, applyPreset, deletePreset, saveMsg,
+      savePreset, applyPreset, deletePreset, saveMsg, pendingCount,
       btDraft, btResults, btLoading, btMsg, btPresetSelected, btPresetNewName,
       runBacktest, applyBtToLive, loadBtPreset,
     };
