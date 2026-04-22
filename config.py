@@ -79,6 +79,21 @@ class Config:
     strategy_d_min_entry_price: float     # skip buys below this price (avoid cheap longshots with 0% win rate)
     strategy_d_leader_min_trades: int     # min settled copies before judging a leader
     strategy_d_leader_min_win_rate: float # blocklist leaders with win% below this after min_trades
+    # --- Leader selection ---
+    strategy_d_leaderboard_window: str    # "7d" / "30d" / "90d" — longer = less noise
+    strategy_d_min_leader_history: int    # min historical trades before we'll follow a leader
+    # --- Consensus signal ---
+    strategy_d_consensus_leaders: int     # require N distinct leaders to buy same token (1 = disable)
+    strategy_d_consensus_window_secs: int # time window to cluster leader buys for consensus
+    # --- Leader bet-size confidence ---
+    strategy_d_min_leader_bet_usdc: float # skip leader trades below this USDC — too speculative
+    strategy_d_size_scale_by_bet: bool    # scale our size by leader's bet size (within max_position)
+    # --- Category specialization ---
+    strategy_d_category_filter_enabled: bool      # only copy leaders in their proven categories
+    strategy_d_category_min_trades: int           # min settled per category before judging
+    strategy_d_category_min_win_rate: float       # min category-specific win rate
+    # --- Inverse copy (opt-in meta strategy) ---
+    strategy_d_inverse_copy: bool         # when true, buy OPPOSITE outcome of leader BUY
 
     # PositionMonitor (auto-exit logic for Strategy D copy trades)
     monitor_enabled: bool
@@ -197,6 +212,16 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_min_entry_price=_f(values.get("STRATEGY_D_MIN_ENTRY_PRICE"), 0.0),
         strategy_d_leader_min_trades=_i(values.get("STRATEGY_D_LEADER_MIN_TRADES"), 10),
         strategy_d_leader_min_win_rate=_f(values.get("STRATEGY_D_LEADER_MIN_WIN_RATE"), 0.30),
+        strategy_d_leaderboard_window=_s(values.get("STRATEGY_D_LEADERBOARD_WINDOW"), "30d"),
+        strategy_d_min_leader_history=_i(values.get("STRATEGY_D_MIN_LEADER_HISTORY"), 100),
+        strategy_d_consensus_leaders=_i(values.get("STRATEGY_D_CONSENSUS_LEADERS"), 1),
+        strategy_d_consensus_window_secs=_i(values.get("STRATEGY_D_CONSENSUS_WINDOW_SECS"), 1800),
+        strategy_d_min_leader_bet_usdc=_f(values.get("STRATEGY_D_MIN_LEADER_BET_USDC"), 100.0),
+        strategy_d_size_scale_by_bet=_b(values.get("STRATEGY_D_SIZE_SCALE_BY_BET"), True),
+        strategy_d_category_filter_enabled=_b(values.get("STRATEGY_D_CATEGORY_FILTER_ENABLED"), False),
+        strategy_d_category_min_trades=_i(values.get("STRATEGY_D_CATEGORY_MIN_TRADES"), 5),
+        strategy_d_category_min_win_rate=_f(values.get("STRATEGY_D_CATEGORY_MIN_WIN_RATE"), 0.40),
+        strategy_d_inverse_copy=_b(values.get("STRATEGY_D_INVERSE_COPY"), False),
         monitor_enabled=_b(values.get("MONITOR_ENABLED"), True),
         monitor_poll_secs=_i(values.get("MONITOR_POLL_SECS"), 30),
         monitor_max_loss_pct=_f(values.get("MONITOR_MAX_LOSS_PCT"), 0.50),

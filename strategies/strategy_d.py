@@ -40,11 +40,36 @@ TRADES_URL = "https://data-api.polymarket.com/trades"
 LEADER_REFRESH_SECS = 3600  # re-check the leaderboard every hour
 
 
+def _trade_size_usdc(trade: dict) -> float:
+    """Extract the USDC $ size of a leader's trade.
+
+    Polymarket trade payloads expose this under different keys depending
+    on endpoint/version. Try the common ones and fall back to size*price.
+    Returns 0 if nothing interpretable.
+    """
+    for key in ("size_usd", "usdcSize", "sizeUsd", "usd_size", "notional"):
+        v = trade.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    # Fall back to shares * price.
+    try:
+        shares = float(trade.get("size") or 0)
+        price = float(trade.get("price") or 0)
+        return shares * price
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass
 class Leader:
     wallet: str
     pseudonym: str
-    pnl_7d: float
+    pnl_window: float      # PnL over the configured leaderboard window (7d/30d/90d)
+    window: str = "7d"     # which window pnl_window covers; exposed in dashboard
+    trade_count: int = 0   # historical trade count — gate on min history
 
 
 class StrategyD:
@@ -69,6 +94,11 @@ class StrategyD:
         # copy consideration.
         self._leader_verdict: dict[str, tuple[bool, float]] = {}
         self._leader_eval_ttl = 600.0  # 10 min
+        # Per-(leader, category) verdict cache for category filtering.
+        self._leader_cat_verdict: dict[tuple[str, str], tuple[bool, float]] = {}
+        # Consensus buffer: {token_id: [(leader_wallet, ts, their_price, their_bet_usdc), ...]}
+        # Garbage-collected each tick to drop entries older than consensus_window_secs.
+        self._consensus_buffer: dict[str, list[tuple[str, float, float, float]]] = {}
 
     async def run(self) -> None:
         self._running = True
@@ -117,6 +147,16 @@ class StrategyD:
             return
         now = time.time()
 
+        # Garbage-collect the consensus buffer: drop any observations
+        # older than the consensus window.
+        consensus_cutoff = now - cfg.strategy_d_consensus_window_secs
+        for tok in list(self._consensus_buffer.keys()):
+            self._consensus_buffer[tok] = [
+                e for e in self._consensus_buffer[tok] if e[1] >= consensus_cutoff
+            ]
+            if not self._consensus_buffer[tok]:
+                del self._consensus_buffer[tok]
+
         # Fetch each leader's trades in parallel — cheap, and gives us
         # effectively simultaneous visibility across all of them.
         results = await asyncio.gather(
@@ -125,6 +165,12 @@ class StrategyD:
         )
 
         window_cutoff = int(now) - cfg.strategy_d_copy_window_secs
+
+        # PASS 1 — record every fresh leader BUY into the consensus buffer
+        # BEFORE we decide whether to copy anything. This way a trade
+        # later in the pass can see a trade earlier in the pass as
+        # supporting consensus.
+        candidates: list[tuple[Leader, dict]] = []
         for lead, trades in zip(self._leaders, results):
             if isinstance(trades, Exception) or not trades:
                 continue
@@ -137,103 +183,150 @@ class StrategyD:
                 ts = int(t.get("timestamp") or 0)
                 if ts < window_cutoff:
                     continue
-                side = (t.get("side") or "").upper()
-                if side != "BUY":
+                if (t.get("side") or "").upper() != "BUY":
                     continue
-
                 token_id = str(t.get("asset") or "")
                 their_price = float(t.get("price") or 0)
-                title = t.get("title") or "?"
-                outcome = t.get("outcome") or "?"
                 if not token_id or their_price <= 0:
                     continue
 
-                await self._consider_copy(
-                    cfg, lead, token_id, their_price, title, outcome, ts,
+                their_bet = _trade_size_usdc(t)
+                self._consensus_buffer.setdefault(token_id, []).append(
+                    (lead.wallet, float(ts), their_price, their_bet)
                 )
+                candidates.append((lead, t))
+
+        # PASS 2 — evaluate each candidate against the fully-populated buffer.
+        for lead, t in candidates:
+            token_id = str(t.get("asset") or "")
+            their_price = float(t.get("price") or 0)
+            title = t.get("title") or "?"
+            outcome = t.get("outcome") or "?"
+            ts = int(t.get("timestamp") or 0)
+            await self._consider_copy(
+                cfg, lead, token_id, their_price, title, outcome, ts,
+            )
 
     # ------------------------------------------------------------------
     # Leader roster management
     # ------------------------------------------------------------------
     async def _refresh_leaders(self, cfg) -> None:
-        """Pull the top-N weekly leaders and filter to those who've traded
-        recently. Silent update if unchanged; logged if the roster shifts."""
-        raw = await self._fetch_top_traders(cfg.strategy_d_num_leaders * 2)
+        """Pull the top-N leaders over the configured window and filter to
+        ACTIVE + sufficiently-experienced. Silent update if unchanged;
+        logged if the roster shifts.
+        """
+        # Pull 3x the target because we'll filter out inactive + low-history.
+        raw = await self._fetch_top_traders(
+            cfg.strategy_d_num_leaders * 3,
+            window=cfg.strategy_d_leaderboard_window,
+        )
         if not raw:
             return
 
-        # Filter by "has a trade within max_leader_idle_hours".
         idle_cutoff = int(time.time()) - cfg.strategy_d_max_leader_idle_hours * 3600
         active: list[Leader] = []
         for cand in raw:
             if len(active) >= cfg.strategy_d_num_leaders:
                 break
-            trades = await self._fetch_recent_trades(cand.wallet, limit=1)
+            # Pull enough history to both confirm recent activity AND
+            # count trades for the history gate. limit=200 is roughly
+            # 1-2 weeks of activity for most leaders.
+            trades = await self._fetch_recent_trades(
+                cand.wallet,
+                limit=max(cfg.strategy_d_min_leader_history, 20),
+            )
             if not trades:
                 continue
             last_ts = int(trades[0].get("timestamp") or 0)
-            if last_ts >= idle_cutoff:
-                active.append(cand)
+            if last_ts < idle_cutoff:
+                continue
+            cand.trade_count = len(trades)
+            # Min-history gate: proven operators only. A leader with
+            # 5 trades is a weekend tourist; we want 100+ trades as
+            # evidence of a real process.
+            if cand.trade_count < cfg.strategy_d_min_leader_history:
+                continue
+            active.append(cand)
 
         if not active:
             await self.state.db.log_event(
                 "warn", "strategy_d",
-                "no active leaders in the top of the weekly board — waiting",
+                f"no active leaders over {cfg.strategy_d_leaderboard_window} "
+                f"with ≥{cfg.strategy_d_min_leader_history} trades — waiting",
             )
             return
 
         old_wallets = {l.wallet for l in self._leaders}
         new_wallets = {l.wallet for l in active}
         if old_wallets != new_wallets:
-            names = ", ".join(f"{l.pseudonym} (${l.pnl_7d/1000:.0f}k)" for l in active)
+            names = ", ".join(
+                f"{l.pseudonym} (${l.pnl_window/1000:.0f}k/{l.window}, {l.trade_count}t)"
+                for l in active
+            )
             await self.state.db.log_event(
                 "info", "strategy_d",
                 f"following {len(active)} leaders: {names}",
                 {"leaders": [
-                    {"wallet": l.wallet, "pseudonym": l.pseudonym, "pnl_7d": l.pnl_7d}
+                    {"wallet": l.wallet, "pseudonym": l.pseudonym,
+                     "pnl_window": l.pnl_window, "window": l.window,
+                     "trade_count": l.trade_count}
                     for l in active
                 ]},
             )
         self._leaders = active
-        # Mirror to state so the web API can expose the current roster.
+        # Mirror to state for the web API. Keep `pnl_7d` key for backward
+        # compat with the existing dashboard column — value now reflects
+        # the configured window (whatever that is).
         self.state.d_leaders = [
-            {"wallet": l.wallet, "pseudonym": l.pseudonym, "pnl_7d": l.pnl_7d}
+            {"wallet": l.wallet, "pseudonym": l.pseudonym,
+             "pnl_7d": l.pnl_window, "pnl_window": l.pnl_window,
+             "window": l.window, "trade_count": l.trade_count}
             for l in active
         ]
         self.state.d_leaders_refreshed_at = time.time()
 
-    async def _fetch_top_traders(self, limit: int) -> list[Leader]:
-        timeout = aiohttp.ClientTimeout(total=15)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(
-                    LEADERBOARD_URL,
-                    params={"window": "7d", "limit": str(limit)},
-                ) as r:
-                    if r.status != 200:
-                        log.warning("leaderboard HTTP %d", r.status)
-                        return []
-                    data = await r.json()
-        except Exception as e:
-            log.warning("leaderboard fetch failed: %s", e)
-            return []
+    async def _fetch_top_traders(self, limit: int, window: str = "7d") -> list[Leader]:
+        """Pull top traders over the configured window. Falls back to 7d if
+        the requested window returns empty (API may not support all windows).
+        """
+        async def _try(w: str) -> list[Leader]:
+            timeout = aiohttp.ClientTimeout(total=15)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(
+                        LEADERBOARD_URL,
+                        params={"window": w, "limit": str(limit)},
+                    ) as r:
+                        if r.status != 200:
+                            log.warning("leaderboard HTTP %d for window %s", r.status, w)
+                            return []
+                        data = await r.json()
+            except Exception as e:
+                log.warning("leaderboard fetch failed (%s): %s", w, e)
+                return []
+            entries = data if isinstance(data, list) else (
+                data.get("data") if isinstance(data, dict) else None
+            )
+            if not entries:
+                return []
+            out: list[Leader] = []
+            for e in entries:
+                wallet = e.get("proxyWallet")
+                if not wallet:
+                    continue
+                out.append(Leader(
+                    wallet=wallet,
+                    pseudonym=e.get("pseudonym") or e.get("name") or wallet[:10],
+                    pnl_window=float(e.get("amount") or 0),
+                    window=w,
+                ))
+            return out
 
-        entries = data if isinstance(data, list) else (
-            data.get("data") if isinstance(data, dict) else None
-        )
-        if not entries:
-            return []
-        out: list[Leader] = []
-        for e in entries:
-            w = e.get("proxyWallet")
-            if not w:
-                continue
-            out.append(Leader(
-                wallet=w,
-                pseudonym=e.get("pseudonym") or e.get("name") or w[:10],
-                pnl_7d=float(e.get("amount") or 0),
-            ))
-        return out
+        result = await _try(window)
+        if result or window == "7d":
+            return result
+        log.info("leaderboard window %s empty — falling back to 7d", window)
+        return await _try("7d")
 
     async def _live_best_ask(self, token_id: str) -> Optional[float]:
         """Query CLOB's order book for a token and return lowest ask.
@@ -284,6 +377,48 @@ class StrategyD:
         self, cfg, leader: Leader, token_id: str, their_price: float,
         title: str, outcome: str, trade_ts: int,
     ) -> None:
+        # Look up the leader's bet size from the consensus buffer (where
+        # we recorded it on PASS 1). If the buffer lost it (edge cases),
+        # treat as 0 and let the bet-size gate decide.
+        obs = self._consensus_buffer.get(token_id, [])
+        their_bet = 0.0
+        for entry in obs:
+            if entry[0] == leader.wallet and abs(entry[1] - trade_ts) < 5:
+                their_bet = entry[3]
+                break
+
+        # Bet-size confidence gate: skip trades where leader barely
+        # committed capital. A leader's $50 "toss" trade carries almost
+        # no signal; their $5k trade is real conviction.
+        if their_bet < cfg.strategy_d_min_leader_bet_usdc:
+            await self.state.db.log_event(
+                "info", "strategy_d",
+                f"skip (leader bet ${their_bet:.0f} < min ${cfg.strategy_d_min_leader_bet_usdc:.0f}) "
+                f"from {leader.pseudonym}: {title[:60]} [{outcome}]",
+                {"leader": leader.wallet, "token_id": token_id,
+                 "their_bet_usdc": their_bet,
+                 "min_leader_bet": cfg.strategy_d_min_leader_bet_usdc},
+            )
+            return
+
+        # Consensus gate: when >1, require N distinct leaders to have
+        # bought the SAME token within the consensus window. Single-
+        # leader signals are noisy; multi-leader agreement is rare and
+        # high-quality. Always counts >= 1 (the current trade itself).
+        if cfg.strategy_d_consensus_leaders > 1:
+            distinct_leaders = {e[0] for e in obs}
+            if len(distinct_leaders) < cfg.strategy_d_consensus_leaders:
+                await self.state.db.log_event(
+                    "info", "strategy_d",
+                    f"skip (consensus {len(distinct_leaders)}/{cfg.strategy_d_consensus_leaders}) "
+                    f"from {leader.pseudonym}: {title[:60]} [{outcome}]",
+                    {"leader": leader.wallet, "token_id": token_id,
+                     "distinct_leaders": len(distinct_leaders),
+                     "consensus_required": cfg.strategy_d_consensus_leaders,
+                     "observations": len(obs)},
+                )
+                return
+
         # Always do a live CLOB book lookup — the registry's status /
         # accepting_orders / best_ask fields can lag behind reality
         # (e.g., markets we mis-marked as 'resolved' in older runs,
@@ -345,6 +480,23 @@ class StrategyD:
             )
             return
 
+        # Category specialization: a leader might be great on NBA but
+        # terrible on tennis. When enabled, we check our own per-category
+        # win rate with this leader and skip the categories they're bad at.
+        if cfg.strategy_d_category_filter_enabled:
+            category = await self._market_category(token_id)
+            if category and await self._leader_category_blocked(
+                leader.wallet, category, cfg,
+            ):
+                await self.state.db.log_event(
+                    "info", "strategy_d",
+                    f"skip (leader {leader.pseudonym} bad in category '{category}'): "
+                    f"{title[:60]} [{outcome}]",
+                    {"leader": leader.wallet, "token_id": token_id,
+                     "category": category},
+                )
+                return
+
         # Dual cap: use the LOOSER of percentage or absolute. Percentage
         # works for expensive positions ($0.97 → 3% is $0.029); absolute
         # works for cheap positions (where 10% of $0.06 = half a cent but
@@ -397,11 +549,18 @@ class StrategyD:
             locked = float(locked or 0)
             effective_available = pool - locked - self._pending_usdc
 
-            # Desired size, capped at max_position.
-            desired = min(
-                pool * cfg.strategy_d_deploy_rate,
-                cfg.strategy_d_max_position,
-            )
+            # Desired size, capped at max_position. If size-scaling by
+            # leader bet size is enabled, add a multiplier: base size at
+            # the min-bet threshold, scaling linearly up to max_position
+            # as leader bet grows to 10x the threshold.
+            base_size = pool * cfg.strategy_d_deploy_rate
+            if cfg.strategy_d_size_scale_by_bet and cfg.strategy_d_min_leader_bet_usdc > 0:
+                scale = min(
+                    their_bet / cfg.strategy_d_min_leader_bet_usdc,
+                    10.0,  # cap at 10x the base size
+                )
+                base_size *= max(1.0, scale)  # never scale DOWN below base
+            desired = min(base_size, cfg.strategy_d_max_position)
             # Never deploy capital that would push us below the pause
             # threshold (emergency buffer).
             deployable = max(0.0, effective_available - cfg.trading_pool_pause_threshold)
@@ -427,24 +586,57 @@ class StrategyD:
             # by _release_slot after _pending_hold_secs.
             self._pending_usdc += size
 
+        # Inverse copy: when opted in, bet the OPPOSITE outcome of what
+        # the leader bought. Useful if we've identified a leader as a
+        # consistent "fish" — their trades become a contra-signal.
+        final_token = token_id
+        final_price = current_ask
+        action_label = "COPY"
+        if cfg.strategy_d_inverse_copy:
+            sibling_tok, sibling_ask = await self._sibling_token_and_ask(token_id)
+            if sibling_tok and sibling_ask is not None:
+                final_token = sibling_tok
+                final_price = sibling_ask
+                action_label = "INVERSE"
+            else:
+                # Can't find sibling (market not in registry, no ask on
+                # other side, etc.). Skip the trade entirely rather than
+                # silently fall back to copy mode.
+                await self.state.db.log_event(
+                    "info", "strategy_d",
+                    f"skip (inverse: no sibling/ask) from {leader.pseudonym}: "
+                    f"{title[:60]} [{outcome}]",
+                    {"leader": leader.wallet, "token_id": token_id,
+                     "inverse": True},
+                )
+                async with self._pending_lock:
+                    self._pending_usdc = max(0.0, self._pending_usdc - size)
+                return
+
         req = OrderRequest(
             strategy="D",
-            token_id=token_id,
+            token_id=final_token,
             side="BUY",
-            limit_price=round(current_ask, 4),
+            limit_price=round(final_price, 4),
             size_usdc=round(size, 2),
-            memo=f"strategy_d copy {leader.pseudonym[:16]}@{their_price:.3f} ({outcome})",
+            memo=(
+                f"strategy_d {action_label.lower()} "
+                f"{leader.pseudonym[:16]}@{their_price:.3f} ({outcome})"
+            ),
             leader_wallet=leader.wallet,
         )
         lag_secs = int(time.time()) - trade_ts
         await self.state.db.log_event(
             "info", "strategy_d",
-            f"COPY from {leader.pseudonym}: BUY ${size:.2f}@{current_ask:.4f} "
-            f"({outcome}, leader@{their_price:.4f} {lag_secs}s ago): {title[:60]}",
+            f"{action_label} from {leader.pseudonym}: BUY ${size:.2f}@{final_price:.4f} "
+            f"({outcome}, leader@{their_price:.4f} bet ${their_bet:.0f} "
+            f"{lag_secs}s ago): {title[:60]}",
             {"leader_wallet": leader.wallet, "leader_pseudonym": leader.pseudonym,
-             "token_id": token_id, "their_price": their_price,
-             "our_price": current_ask, "size": size, "lag_secs": lag_secs,
-             "title": title, "outcome": outcome},
+             "token_id": final_token, "original_token_id": token_id,
+             "their_price": their_price, "their_bet_usdc": their_bet,
+             "our_price": final_price, "size": size, "lag_secs": lag_secs,
+             "title": title, "outcome": outcome,
+             "inverse": action_label == "INVERSE"},
         )
         await self.state.emit(
             self.state.execution_queue,
@@ -463,6 +655,80 @@ class StrategyD:
         await asyncio.sleep(self._pending_hold_secs)
         async with self._pending_lock:
             self._pending_usdc = max(0.0, self._pending_usdc - reserved)
+
+    async def _market_category(self, token_id: str) -> Optional[str]:
+        """Look up the market's category from the registry. Lowercased,
+        trimmed, None if unknown. Cheap: indexed by token_id."""
+        row = await self.state.db.fetchone(
+            "SELECT category FROM markets WHERE token_id = ?",
+            (token_id,),
+        )
+        if not row:
+            return None
+        c = row["category"]
+        if not c:
+            return None
+        return str(c).strip().lower() or None
+
+    async def _leader_category_blocked(
+        self, wallet: str, category: str, cfg,
+    ) -> bool:
+        """Block a leader for a specific category when our copy win rate
+        in that category is bad. Same shape as _leader_blocked but scoped.
+        """
+        now = time.time()
+        key = (wallet, category)
+        cached = self._leader_cat_verdict.get(key)
+        if cached and (now - cached[1]) < self._leader_eval_ttl:
+            return cached[0]
+
+        row = await self.state.db.fetchone(
+            "SELECT COUNT(*) AS n, "
+            "       SUM(CASE WHEN p.gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       COALESCE(SUM(p.gain_usdc), 0) AS total_gain "
+            "FROM positions p "
+            "JOIN markets m ON m.token_id = p.market_token_id "
+            "WHERE p.leader_wallet = ? AND p.strategy = 'D' "
+            "  AND p.status = 'settled' AND LOWER(m.category) = ?",
+            (wallet, category),
+        )
+        n = int(row["n"] or 0) if row else 0
+        wins = int(row["wins"] or 0) if row else 0
+        total_gain = float(row["total_gain"] or 0) if row else 0.0
+
+        blocked = False
+        if n >= cfg.strategy_d_category_min_trades:
+            win_rate = wins / n if n > 0 else 0.0
+            if win_rate < cfg.strategy_d_category_min_win_rate and total_gain < 0:
+                blocked = True
+
+        self._leader_cat_verdict[key] = (blocked, now)
+        return blocked
+
+    async def _sibling_token_and_ask(
+        self, token_id: str,
+    ) -> tuple[Optional[str], Optional[float]]:
+        """For a binary market, return the opposite outcome's token_id
+        and its current live ask. Used by inverse-copy mode. Returns
+        (None, None) if we can't identify a sibling or get an ask.
+        """
+        row = await self.state.db.fetchone(
+            "SELECT condition_id FROM markets WHERE token_id = ?",
+            (token_id,),
+        )
+        cid = row["condition_id"] if row else None
+        if not cid:
+            return None, None
+        sibling = await self.state.db.fetchone(
+            "SELECT token_id FROM markets "
+            "WHERE condition_id = ? AND token_id != ? LIMIT 1",
+            (cid, token_id),
+        )
+        if not sibling:
+            return None, None
+        sibling_token = sibling["token_id"]
+        ask = await self._live_best_ask(sibling_token)
+        return sibling_token, ask
 
     async def _leader_blocked(self, wallet: str, cfg) -> bool:
         """Return True if this leader's recent copy P&L disqualifies them.

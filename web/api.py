@@ -612,6 +612,32 @@ def create_app(state: StateManager) -> FastAPI:
         )
         copied_tokens = {r["market_token_id"] for r in copied_rows}
 
+        # Per-leader copy performance stats — which leaders are actually
+        # making us money?
+        wallets = [l["wallet"] for l in leaders_list]
+        leader_stats: dict[str, dict] = {w: {"trades": 0, "wins": 0, "pnl": 0.0, "open": 0}
+                                         for w in wallets}
+        if wallets:
+            qmarks = ",".join("?" for _ in wallets)
+            rows = await db.fetchall(
+                f"SELECT leader_wallet, status, "
+                f"       COALESCE(gain_usdc, 0) AS gain "
+                f"FROM positions "
+                f"WHERE strategy = 'D' AND leader_wallet IN ({qmarks})",
+                tuple(wallets),
+            )
+            for r in rows:
+                w = r["leader_wallet"]
+                if w not in leader_stats:
+                    continue
+                if r["status"] == "settled":
+                    leader_stats[w]["trades"] += 1
+                    leader_stats[w]["pnl"] += float(r["gain"])
+                    if float(r["gain"]) > 0:
+                        leader_stats[w]["wins"] += 1
+                elif r["status"] in ("open", "awaiting_redeem"):
+                    leader_stats[w]["open"] += 1
+
         async with aiohttp.ClientSession() as session:
             tasks = [_fetch(session, lead["wallet"]) for lead in leaders_list]
             trade_lists = await asyncio.gather(*tasks, return_exceptions=True)
@@ -625,12 +651,27 @@ def create_app(state: StateManager) -> FastAPI:
             for t in trades:
                 token = str(t.get("asset") or "")
                 ts = int(t.get("timestamp") or 0)
+                # Prefer explicit USDC size fields; fall back to shares*price.
+                size_usd = None
+                for key in ("size_usd", "usdcSize", "sizeUsd", "usd_size", "notional"):
+                    if t.get(key) is not None:
+                        try:
+                            size_usd = float(t[key])
+                            break
+                        except (TypeError, ValueError):
+                            pass
+                if size_usd is None:
+                    try:
+                        size_usd = float(t.get("size") or 0) * float(t.get("price") or 0)
+                    except (TypeError, ValueError):
+                        size_usd = 0.0
                 enriched.append({
                     "tx_hash": t.get("transactionHash"),
                     "token_id": token,
                     "side": t.get("side"),
                     "price": t.get("price"),
                     "size": t.get("size"),
+                    "size_usdc": size_usd,
                     "timestamp": ts,
                     "age_secs": max(0, now - ts),
                     "title": t.get("title"),
@@ -638,16 +679,109 @@ def create_app(state: StateManager) -> FastAPI:
                     "event_slug": t.get("eventSlug"),
                     "copied_by_us": token in copied_tokens,
                 })
+            ls = leader_stats.get(lead["wallet"], {"trades": 0, "wins": 0, "pnl": 0.0, "open": 0})
+            win_rate = (ls["wins"] / ls["trades"]) if ls["trades"] else None
             out.append({
                 "wallet": lead["wallet"],
                 "pseudonym": lead["pseudonym"],
                 "pnl_7d": lead["pnl_7d"],
+                "pnl_window": lead.get("pnl_window", lead["pnl_7d"]),
+                "window": lead.get("window", "7d"),
+                "trade_count": lead.get("trade_count", 0),
                 "trades": enriched,
                 "last_trade_age_secs": enriched[0]["age_secs"] if enriched else None,
+                "copy_stats": {
+                    "settled": ls["trades"],
+                    "wins": ls["wins"],
+                    "pnl": round(ls["pnl"], 2),
+                    "win_rate": win_rate,
+                    "open_positions": ls["open"],
+                },
             })
         return {
             "leaders": out,
             "refreshed_at": state.d_leaders_refreshed_at,
+        }
+
+    # ------------------------------------------------------------------
+    # GET /api/strategy-d-stats — comprehensive analytics for Strategy D
+    # ------------------------------------------------------------------
+    @app.get("/api/strategy-d-stats")
+    async def strategy_d_stats() -> dict:
+        """Returns per-leader-per-category performance, recent consensus
+        events, and active filter config. Powers the 'Strategy D' tab.
+        """
+        db = get_db()
+        cfg = state.cfg if hasattr(state, "cfg") else None  # may not be on state
+        from config import get_config as _gc
+        cfg = _gc()
+
+        # Per-leader-per-category P&L (settled D positions only)
+        cat_rows = await db.fetchall(
+            "SELECT p.leader_wallet AS wallet, "
+            "       LOWER(COALESCE(m.category, 'uncategorized')) AS category, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN p.gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(SUM(COALESCE(p.gain_usdc, 0)), 2) AS total_pnl "
+            "FROM positions p "
+            "LEFT JOIN markets m ON m.token_id = p.market_token_id "
+            "WHERE p.strategy = 'D' AND p.status = 'settled' "
+            "  AND p.leader_wallet IS NOT NULL "
+            "GROUP BY p.leader_wallet, category "
+            "ORDER BY total_pnl DESC"
+        )
+        # Build {wallet: [{category, n, wins, total_pnl, win_rate}, ...]}
+        per_leader_category: dict[str, list[dict]] = {}
+        for r in cat_rows:
+            entry = {
+                "category": r["category"],
+                "trades": int(r["n"]),
+                "wins": int(r["wins"] or 0),
+                "total_pnl": float(r["total_pnl"] or 0),
+                "win_rate": (int(r["wins"] or 0) / int(r["n"])) if int(r["n"]) else 0.0,
+            }
+            per_leader_category.setdefault(r["wallet"], []).append(entry)
+
+        # Overall category performance (across all leaders)
+        overall_cat_rows = await db.fetchall(
+            "SELECT LOWER(COALESCE(m.category, 'uncategorized')) AS category, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN p.gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(SUM(COALESCE(p.gain_usdc, 0)), 2) AS total_pnl "
+            "FROM positions p "
+            "LEFT JOIN markets m ON m.token_id = p.market_token_id "
+            "WHERE p.strategy = 'D' AND p.status = 'settled' "
+            "GROUP BY category "
+            "ORDER BY total_pnl DESC"
+        )
+        overall_by_category = [
+            {"category": r["category"], "trades": int(r["n"]),
+             "wins": int(r["wins"] or 0),
+             "total_pnl": float(r["total_pnl"] or 0),
+             "win_rate": (int(r["wins"] or 0) / int(r["n"])) if int(r["n"]) else 0.0}
+            for r in overall_cat_rows
+        ]
+
+        # Active filter config — what's gating trades right now
+        filters = {
+            "leaderboard_window": cfg.strategy_d_leaderboard_window,
+            "num_leaders": cfg.strategy_d_num_leaders,
+            "min_leader_history": cfg.strategy_d_min_leader_history,
+            "consensus_leaders": cfg.strategy_d_consensus_leaders,
+            "consensus_window_secs": cfg.strategy_d_consensus_window_secs,
+            "min_leader_bet_usdc": cfg.strategy_d_min_leader_bet_usdc,
+            "size_scale_by_bet": cfg.strategy_d_size_scale_by_bet,
+            "min_entry_price": cfg.strategy_d_min_entry_price,
+            "max_entry_price": cfg.strategy_d_max_entry_price,
+            "max_price_downward": cfg.strategy_d_max_price_downward,
+            "category_filter_enabled": cfg.strategy_d_category_filter_enabled,
+            "inverse_copy": cfg.strategy_d_inverse_copy,
+        }
+
+        return {
+            "overall_by_category": overall_by_category,
+            "per_leader_category": per_leader_category,
+            "filters": filters,
         }
 
     # ------------------------------------------------------------------
