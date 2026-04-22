@@ -417,6 +417,7 @@ def create_app(state: StateManager) -> FastAPI:
         """
         from backtest import (
             FilterConfig, fetch_leaderboard, fetch_user_trades, run_sim,
+            backfill_resolutions,
         )
         import time as _t
         leaders_cfg = body.get("leaders") or {}
@@ -466,6 +467,25 @@ def create_app(state: StateManager) -> FastAPI:
                 fetched += 1
 
         db = get_db()
+
+        # Option A: before running the sim, backfill resolution data for
+        # every unique token the leaders touched. This populates our DB
+        # so subsequent backtests (and the dashboard) have richer data.
+        unique_tokens = set()
+        for trades in trades_by_leader.values():
+            for t in trades:
+                if (t.get("side") or "").upper() != "BUY":
+                    continue
+                tok = str(t.get("asset") or "")
+                if tok:
+                    unique_tokens.add(tok)
+        try:
+            resolutions = await backfill_resolutions(db, list(unique_tokens))
+        except Exception:
+            import logging
+            logging.exception("backfill_resolutions failed")
+            resolutions = {}
+
         results = []
         per_leader_detail = {}
         for i, f_dict in enumerate(filters_body):
@@ -497,6 +517,8 @@ def create_app(state: StateManager) -> FastAPI:
                 "cached": cached_hits,
                 "window": window,
                 "trade_limit": trade_limit,
+                "unique_tokens": len(unique_tokens),
+                "resolved_tokens": len(resolutions),
             },
         }
 

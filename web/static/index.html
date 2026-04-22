@@ -567,6 +567,9 @@
         </button>
         <span v-if="btResults.meta" class="text-xs text-slate-500">
           {{ btResults.meta.wallets }} wallets · {{ btResults.meta.fetched }} fetched + {{ btResults.meta.cached }} cached
+          <span v-if="btResults.meta.unique_tokens">
+            · {{ btResults.meta.resolved_tokens }} / {{ btResults.meta.unique_tokens }} tokens resolved
+          </span>
         </span>
         <span v-if="btMsg" class="text-xs" :class="btMsg.startsWith('✓') ? 'text-emerald-400' : 'text-rose-400'">{{ btMsg }}</span>
       </div>
