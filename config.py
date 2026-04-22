@@ -70,6 +70,7 @@ class Config:
     strategy_d_max_position: float
     strategy_d_max_price_slippage: float  # max % worse price than leader's fill
     strategy_d_max_price_slippage_abs: float  # max absolute worse ($) — looser of the two wins
+    strategy_d_max_price_downward: float  # skip if price fell more than X% below leader's fill (0.0 = any drop fails)
     strategy_d_poll_secs: int             # how often to re-check each leader
     strategy_d_copy_window_secs: int      # only copy trades within N sec of now
     strategy_d_num_leaders: int           # how many top traders to follow
@@ -187,6 +188,7 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_max_position=_f(values.get("STRATEGY_D_MAX_POSITION"), 10.00),
         strategy_d_max_price_slippage=_f(values.get("STRATEGY_D_MAX_PRICE_SLIPPAGE"), 0.10),
         strategy_d_max_price_slippage_abs=_f(values.get("STRATEGY_D_MAX_PRICE_SLIPPAGE_ABS"), 0.03),
+        strategy_d_max_price_downward=_f(values.get("STRATEGY_D_MAX_PRICE_DOWNWARD"), 0.05),
         strategy_d_poll_secs=_i(values.get("STRATEGY_D_POLL_SECS"), 60),
         strategy_d_copy_window_secs=_i(values.get("STRATEGY_D_COPY_WINDOW_SECS"), 900),
         strategy_d_num_leaders=_i(values.get("STRATEGY_D_NUM_LEADERS"), 5),

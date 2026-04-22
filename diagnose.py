@@ -239,6 +239,7 @@ async def main() -> None:
                   "strategy_d_max_position", "strategy_d_max_entry_price",
                   "strategy_d_min_entry_price",
                   "strategy_d_max_price_slippage", "strategy_d_max_price_slippage_abs",
+                  "strategy_d_max_price_downward",
                   "strategy_d_copy_window_secs", "strategy_d_num_leaders",
                   "strategy_d_leader_min_trades", "strategy_d_leader_min_win_rate",
                   "monitor_enabled", "monitor_max_loss_pct",

@@ -364,6 +364,24 @@ class StrategyD:
             )
             return
 
+        # Downward drift guard: if the ask has fallen meaningfully below
+        # what the leader paid, something changed — a goal scored, a
+        # set lost, news broke. The leader's thesis is stale. Copying
+        # at a "discount" is buying a falling knife into the exact drop
+        # they'd have wanted to avoid if they saw it coming.
+        downward_floor = their_price * (1 - cfg.strategy_d_max_price_downward)
+        if current_ask < downward_floor:
+            await self.state.db.log_event(
+                "info", "strategy_d",
+                f"skip downward drift from {leader.pseudonym}: "
+                f"paid {their_price:.4f}, now {current_ask:.4f} "
+                f"(floor {downward_floor:.4f}): {title[:60]} [{outcome}]",
+                {"leader": leader.wallet, "token_id": token_id,
+                 "their_price": their_price, "current_ask": current_ask,
+                 "floor": downward_floor, "title": title, "outcome": outcome},
+            )
+            return
+
         # Capital-driven sizing: no fixed max_concurrent. We simply let
         # the bot stack as many copy trades as the pool can afford,
         # always leaving TRADING_POOL_PAUSE_THRESHOLD as a safety buffer.
