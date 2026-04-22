@@ -64,7 +64,7 @@ class StrategyC:
         log.info("strategy C starting (scan every %ds)", SCAN_SECS)
         while self._running:
             cfg = get_config()
-            if cfg.strategy_c_enabled:
+            if cfg.bot_enabled and cfg.strategy_c_enabled:
                 try:
                     await self._scan(cfg)
                 except Exception:

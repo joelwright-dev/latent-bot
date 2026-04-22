@@ -95,7 +95,7 @@ class PositionMonitor:
         )
         while self._running:
             cfg = get_config()
-            if not cfg.monitor_enabled or self._clob is None:
+            if not cfg.bot_enabled or not cfg.monitor_enabled or self._clob is None:
                 await asyncio.sleep(cfg.monitor_poll_secs)
                 continue
             try:

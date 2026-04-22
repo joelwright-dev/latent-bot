@@ -124,8 +124,9 @@ class StrategyD:
             except Exception:
                 log.exception("leader refresh failed")
 
-            # Copy-trade polling only runs if the strategy is enabled.
-            if cfg.strategy_d_enabled:
+            # Copy-trade polling only runs if the strategy is enabled AND
+            # the global kill switch (bot_enabled) is on.
+            if cfg.bot_enabled and cfg.strategy_d_enabled:
                 try:
                     await self._tick(cfg)
                 except Exception:

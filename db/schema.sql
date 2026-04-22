@@ -150,3 +150,18 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER PRIMARY KEY,
     applied_at INTEGER NOT NULL
 );
+
+-- ---------------------------------------------------------------------------
+-- config_presets: named snapshots of live config OR backtest params.
+-- Used to quickly swap between tuning experiments without retyping values.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS config_presets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    scope      TEXT NOT NULL CHECK(scope IN ('live', 'backtest')),
+    params     TEXT NOT NULL,  -- JSON blob
+    notes      TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE(name, scope)
+);
+CREATE INDEX IF NOT EXISTS idx_config_presets_scope ON config_presets(scope);

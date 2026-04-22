@@ -109,9 +109,13 @@ def create_app(state: StateManager) -> FastAPI:
     # ------------------------------------------------------------------
     @app.get("/api/status")
     async def status() -> dict:
+        from config import get_config as _gc
+        cfg = _gc()
         now = time.time()
         hb_age = now - state.last_heartbeat
-        if state.paused_reason:
+        if not cfg.bot_enabled:
+            color = "red"
+        elif state.paused_reason:
             color = "red"
         elif hb_age > 60:
             color = "amber"
@@ -119,6 +123,7 @@ def create_app(state: StateManager) -> FastAPI:
             color = "green"
         return {
             "running": state.paused_reason is None,
+            "bot_enabled": cfg.bot_enabled,
             "paused_reason": state.paused_reason,
             "started_at": state.started_at,
             "uptime_secs": now - state.started_at,
@@ -358,9 +363,9 @@ def create_app(state: StateManager) -> FastAPI:
     async def toggle_strategy(body: dict) -> dict:
         which = body.get("strategy")
         enabled = bool(body.get("enabled"))
-        if which not in ("A", "B"):
-            raise HTTPException(status_code=400, detail="strategy must be 'A' or 'B'")
-        key = "STRATEGY_A_ENABLED" if which == "A" else "STRATEGY_B_ENABLED"
+        if which not in ("A", "B", "C", "D"):
+            raise HTTPException(status_code=400, detail="strategy must be 'A','B','C' or 'D'")
+        key = f"STRATEGY_{which}_ENABLED"
         await update_config({key: enabled})
         await state.broadcast(Signal(
             kind=SignalKind.DASHBOARD_REFRESH,
@@ -368,6 +373,231 @@ def create_app(state: StateManager) -> FastAPI:
             source="api",
         ))
         return {"ok": True, "strategy": which, "enabled": enabled}
+
+    # ------------------------------------------------------------------
+    # POST /api/bot/toggle — master kill switch (pauses all strategies + monitor)
+    # ------------------------------------------------------------------
+    @app.post("/api/bot/toggle", dependencies=[Depends(require_auth)])
+    async def toggle_bot(body: dict) -> dict:
+        enabled = bool(body.get("enabled"))
+        await update_config({"BOT_ENABLED": enabled})
+        await get_db().log_event(
+            "warn" if not enabled else "info", "config",
+            f"bot_enabled set to {enabled} via dashboard",
+        )
+        await state.broadcast(Signal(
+            kind=SignalKind.DASHBOARD_REFRESH,
+            payload={"section": "config"},
+            source="api",
+        ))
+        return {"ok": True, "bot_enabled": enabled}
+
+    # ------------------------------------------------------------------
+    # POST /api/backtest/run — server-side backtest
+    # ------------------------------------------------------------------
+    # Simple in-process cache. Fetching Polymarket trade history is
+    # expensive; we cache per-wallet for 10 min so tuning knobs is snappy.
+    _bt_trades_cache: dict[str, tuple[float, list[dict]]] = {}
+    _bt_leaderboard_cache: dict[tuple[int, str], tuple[float, list[dict]]] = {}
+    _BT_TTL = 600.0
+
+    @app.post("/api/backtest/run", dependencies=[Depends(require_auth)])
+    async def run_backtest(body: dict) -> dict:
+        """Runs a backtest using Polymarket historical trades against
+        filter config. Body:
+          {
+            "filters": [{name, min_entry_price, max_entry_price, ...}, ...],
+            "leaders": {
+              "window": "30d", "num_leaders": 10,
+              "wallets": [...optional explicit wallet list...],
+              "trade_limit": 500,
+            }
+          }
+        Returns per-filter stats + per-leader breakdown for the first filter.
+        """
+        from backtest import (
+            FilterConfig, fetch_leaderboard, fetch_user_trades, run_sim,
+        )
+        import time as _t
+        leaders_cfg = body.get("leaders") or {}
+        window = leaders_cfg.get("window") or "30d"
+        num_leaders = int(leaders_cfg.get("num_leaders") or 10)
+        trade_limit = int(leaders_cfg.get("trade_limit") or 500)
+        explicit_wallets = leaders_cfg.get("wallets") or []
+        filters_body = body.get("filters") or []
+        if not filters_body:
+            raise HTTPException(400, detail="at least one filter config required")
+
+        pseud: dict[str, str] = {}
+        if explicit_wallets:
+            wallets = [w for w in explicit_wallets if w]
+        else:
+            cache_key = (num_leaders, window)
+            now_ts = _t.time()
+            entry = _bt_leaderboard_cache.get(cache_key)
+            if entry and now_ts - entry[0] < _BT_TTL:
+                raw = entry[1]
+            else:
+                raw = await fetch_leaderboard(num_leaders, window)
+                _bt_leaderboard_cache[cache_key] = (now_ts, raw)
+            wallets = [e.get("proxyWallet") for e in raw if e.get("proxyWallet")]
+            for e in raw:
+                w = e.get("proxyWallet")
+                if w:
+                    pseud[w] = e.get("pseudonym") or e.get("name") or w[:10]
+
+        if not wallets:
+            raise HTTPException(500, detail="no wallets resolved")
+
+        # Fetch trades for all wallets (cached)
+        now_ts = _t.time()
+        trades_by_leader: dict[str, list[dict]] = {}
+        fetched = 0
+        cached_hits = 0
+        for w in wallets:
+            entry = _bt_trades_cache.get(w)
+            if entry and now_ts - entry[0] < _BT_TTL:
+                trades_by_leader[w] = entry[1]
+                cached_hits += 1
+            else:
+                trades = await fetch_user_trades(w, trade_limit)
+                _bt_trades_cache[w] = (now_ts, trades)
+                trades_by_leader[w] = trades
+                fetched += 1
+
+        db = get_db()
+        results = []
+        per_leader_detail = {}
+        for i, f_dict in enumerate(filters_body):
+            f = FilterConfig.from_dict(f_dict)
+            stats = await run_sim(db, trades_by_leader, f)
+            results.append({
+                "name": f.name,
+                "trades": stats.trades,
+                "wins": stats.wins,
+                "win_rate": stats.win_rate,
+                "total_pnl": round(stats.total_pnl, 2),
+                "skipped": stats.skipped,
+                "unresolved": stats.unresolved,
+            })
+            # Only include per-leader detail for the first filter to keep
+            # the payload small.
+            if i == 0:
+                per_leader_detail = {
+                    w: {"pseudonym": pseud.get(w, w[:10]), **s}
+                    for w, s in stats.by_leader.items()
+                }
+
+        return {
+            "results": results,
+            "per_leader": per_leader_detail,
+            "meta": {
+                "wallets": len(wallets),
+                "fetched": fetched,
+                "cached": cached_hits,
+                "window": window,
+                "trade_limit": trade_limit,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Config presets (named snapshots of live config or backtest params)
+    # ------------------------------------------------------------------
+    import json as _json
+
+    @app.get("/api/config/presets")
+    async def list_presets(scope: str = "live", full: int = 0) -> dict:
+        if scope not in ("live", "backtest"):
+            raise HTTPException(400, detail="scope must be 'live' or 'backtest'")
+        cols = "id, name, scope, created_at, notes"
+        if full:
+            cols += ", params"
+        rows = await get_db().fetchall(
+            f"SELECT {cols} FROM config_presets "
+            f"WHERE scope = ? ORDER BY created_at DESC",
+            (scope,),
+        )
+        out = []
+        for r in rows:
+            entry = {"id": r["id"], "name": r["name"], "scope": r["scope"],
+                     "created_at": r["created_at"], "notes": r["notes"]}
+            if full:
+                try:
+                    entry["params"] = _json.loads(r["params"]) if r["params"] else {}
+                except Exception:
+                    entry["params"] = {}
+            out.append(entry)
+        return {"presets": out}
+
+    @app.post("/api/config/presets", dependencies=[Depends(require_auth)])
+    async def save_preset(body: dict) -> dict:
+        name = (body.get("name") or "").strip()
+        scope = body.get("scope", "live")
+        params = body.get("params") or {}
+        notes = body.get("notes")
+        if not name:
+            raise HTTPException(400, detail="name is required")
+        if scope not in ("live", "backtest"):
+            raise HTTPException(400, detail="scope must be 'live' or 'backtest'")
+        # Strip sensitive fields before persisting — presets are viewable.
+        for k in ("private_key", "dashboard_secret", "polymarket_proxy_address"):
+            params.pop(k, None)
+        db = get_db()
+        # Replace on unique(name, scope) collision.
+        existing = await db.fetchone(
+            "SELECT id FROM config_presets WHERE name = ? AND scope = ?",
+            (name, scope),
+        )
+        now = int(time.time())
+        if existing:
+            await db.execute(
+                "UPDATE config_presets SET params = ?, notes = ?, created_at = ? "
+                "WHERE id = ?",
+                (_json.dumps(params), notes, now, existing["id"]),
+            )
+            preset_id = existing["id"]
+        else:
+            preset_id = await db.execute(
+                "INSERT INTO config_presets(name, scope, params, notes, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, scope, _json.dumps(params), notes, now),
+            )
+        return {"ok": True, "id": preset_id}
+
+    @app.post("/api/config/presets/{preset_id}/apply",
+              dependencies=[Depends(require_auth)])
+    async def apply_preset(preset_id: int) -> dict:
+        db = get_db()
+        row = await db.fetchone(
+            "SELECT name, scope, params FROM config_presets WHERE id = ?",
+            (preset_id,),
+        )
+        if not row:
+            raise HTTPException(404, detail="preset not found")
+        if row["scope"] != "live":
+            raise HTTPException(400, detail="only live presets can be applied")
+        params = _json.loads(row["params"])
+        # Convert to env-var format for update_config.
+        env_updates = {k.upper(): v for k, v in params.items() if v is not None}
+        try:
+            await update_config(env_updates)
+        except (KeyError, ValueError) as e:
+            raise HTTPException(400, detail=str(e)) from e
+        await db.log_event(
+            "info", "config",
+            f"applied preset '{row['name']}' via dashboard",
+            {"preset_id": preset_id},
+        )
+        return {"ok": True, "applied": row["name"]}
+
+    @app.delete("/api/config/presets/{preset_id}",
+                dependencies=[Depends(require_auth)])
+    async def delete_preset(preset_id: int) -> dict:
+        db = get_db()
+        await db.execute(
+            "DELETE FROM config_presets WHERE id = ?", (preset_id,),
+        )
+        return {"ok": True}
 
     # ------------------------------------------------------------------
     # GET /api/events

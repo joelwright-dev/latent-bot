@@ -36,6 +36,10 @@ class Config:
     polymarket_proxy_address: str
     polygon_rpc_url: str
 
+    # Runtime kill-switch — when false, all strategies + monitor pause.
+    # Useful for "something's off, stop trading but leave service running".
+    bot_enabled: bool
+
     # Capital
     gain_pool_split: float
     min_order_size: float
@@ -178,6 +182,7 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         private_key=_s(values.get("PRIVATE_KEY")),
         polymarket_proxy_address=_s(values.get("POLYMARKET_PROXY_ADDRESS")),
         polygon_rpc_url=_s(values.get("POLYGON_RPC_URL")),
+        bot_enabled=_b(values.get("BOT_ENABLED"), True),
         gain_pool_split=_f(values.get("GAIN_POOL_SPLIT"), 0.50),
         min_order_size=_f(values.get("MIN_ORDER_SIZE"), 2.00),
         trading_pool_pause_threshold=_f(values.get("TRADING_POOL_PAUSE_THRESHOLD"), 20.00),

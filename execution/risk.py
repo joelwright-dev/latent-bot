@@ -65,6 +65,9 @@ async def check_ready(strategy: str, db: Optional[Database] = None) -> None:
     cfg = get_config()
     db = db or get_db()
 
+    # Master kill switch — when off, nothing trades regardless of per-strategy flags.
+    if not cfg.bot_enabled:
+        raise StrategyPaused("bot_enabled is false (master kill switch)")
     if strategy == "A" and not cfg.strategy_a_enabled:
         raise StrategyPaused("strategy A disabled in config")
     if strategy == "B" and not cfg.strategy_b_enabled:

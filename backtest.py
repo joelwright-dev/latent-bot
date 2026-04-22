@@ -44,7 +44,7 @@ log = logging.getLogger("backtest")
 @dataclass
 class FilterConfig:
     """Subset of production config relevant to filtering decisions."""
-    name: str
+    name: str = "custom"
     min_entry_price: float = 0.0
     max_entry_price: float = 1.0
     min_leader_bet_usdc: float = 0.0
@@ -52,6 +52,20 @@ class FilterConfig:
     consensus_window_secs: int = 1800
     require_category: Optional[str] = None
     inverse: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FilterConfig":
+        """Build from a flat dict matching the dashboard form keys."""
+        return cls(
+            name=d.get("name", "custom"),
+            min_entry_price=float(d.get("min_entry_price") or 0.0),
+            max_entry_price=float(d.get("max_entry_price") or 1.0),
+            min_leader_bet_usdc=float(d.get("min_leader_bet_usdc") or 0.0),
+            consensus_leaders=int(d.get("consensus_leaders") or 1),
+            consensus_window_secs=int(d.get("consensus_window_secs") or 1800),
+            require_category=(d.get("require_category") or None) or None,
+            inverse=bool(d.get("inverse") or False),
+        )
 
 
 @dataclass
@@ -68,7 +82,7 @@ class SimStats:
         return self.wins / self.trades if self.trades else 0.0
 
 
-async def _fetch_leaderboard(limit: int, window: str) -> list[dict]:
+async def fetch_leaderboard(limit: int, window: str) -> list[dict]:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
         async with s.get(LEADERBOARD_URL, params={"window": window, "limit": str(limit)}) as r:
             if r.status != 200:
@@ -82,7 +96,7 @@ async def _fetch_leaderboard(limit: int, window: str) -> list[dict]:
     return []
 
 
-async def _fetch_user_trades(wallet: str, limit: int = 500) -> list[dict]:
+async def fetch_user_trades(wallet: str, limit: int = 500) -> list[dict]:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
         async with s.get(TRADES_URL, params={"user": wallet, "limit": str(limit)}) as r:
             if r.status != 200:
@@ -138,7 +152,7 @@ async def _market_category(db, token_id: str) -> Optional[str]:
     return str(c).strip().lower() if c else None
 
 
-async def _run_sim(
+async def run_sim(
     db, trades_by_leader: dict[str, list[dict]], f: FilterConfig,
 ) -> SimStats:
     stats = SimStats()
@@ -255,7 +269,7 @@ async def main() -> None:
         wallets = [w.strip() for w in args.wallets.split(",") if w.strip()]
     else:
         log.info("fetching top %d traders over %s", args.num_leaders, args.window)
-        raw = await _fetch_leaderboard(args.num_leaders, args.window)
+        raw = await fetch_leaderboard(args.num_leaders, args.window)
         wallets = [e.get("proxyWallet") for e in raw if e.get("proxyWallet")]
         for e in raw:
             w = e.get("proxyWallet")
@@ -271,7 +285,7 @@ async def main() -> None:
     log.info("fetching %d trades per wallet (max)", args.limit)
     trades_by_leader: dict[str, list[dict]] = {}
     for w in wallets:
-        trades = await _fetch_user_trades(w, args.limit)
+        trades = await fetch_user_trades(w, args.limit)
         trades_by_leader[w] = trades
         log.info("  %s (%s): %d trades",
                  pseud.get(w, w[:10]), w[:10], len(trades))
@@ -292,8 +306,8 @@ async def main() -> None:
     print("\n" + "=" * 95)
     print(f"BACKTEST — {len(wallets)} leaders over {args.window}")
     print("=" * 95)
-    print(_fmt_stats(await _run_sim(db, trades_by_leader, baseline), baseline.name))
-    print(_fmt_stats(await _run_sim(db, trades_by_leader, current_prod), current_prod.name))
+    print(_fmt_stats(await run_sim(db, trades_by_leader, baseline), baseline.name))
+    print(_fmt_stats(await run_sim(db, trades_by_leader, current_prod), current_prod.name))
 
     if args.sweep:
         sweeps = [
@@ -316,11 +330,11 @@ async def main() -> None:
         ]
         print("-" * 95)
         for s in sweeps:
-            print(_fmt_stats(await _run_sim(db, trades_by_leader, s), s.name))
+            print(_fmt_stats(await run_sim(db, trades_by_leader, s), s.name))
 
     # Per-leader breakdown under current prod
     print("\nPer-leader breakdown (current prod settings):")
-    stats = await _run_sim(db, trades_by_leader, current_prod)
+    stats = await run_sim(db, trades_by_leader, current_prod)
     rows = sorted(stats.by_leader.items(), key=lambda kv: kv[1]["total_pnl"])
     for w, s in rows:
         if s["trades"] == 0 and s["skipped"] == 0:

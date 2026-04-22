@@ -28,7 +28,7 @@ import aiosqlite
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
@@ -174,6 +174,25 @@ class Database:
                     await self._conn.execute(
                         "ALTER TABLE positions ADD COLUMN leader_wallet TEXT"
                     )
+            elif target == 12:
+                # v11 -> v12: named config presets. Stored as JSON blob of
+                # the subset of Config fields the user wants to snapshot.
+                # scope distinguishes live-bot presets from backtest presets.
+                await self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS config_presets ("
+                    "  id         INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  name       TEXT NOT NULL,"
+                    "  scope      TEXT NOT NULL CHECK(scope IN ('live', 'backtest')),"
+                    "  params     TEXT NOT NULL,"   # JSON
+                    "  notes      TEXT,"
+                    "  created_at INTEGER NOT NULL,"
+                    "  UNIQUE(name, scope)"
+                    ")"
+                )
+                await self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_config_presets_scope "
+                    "ON config_presets(scope)"
+                )
             elif target in (5, 6, 7, 8):
                 # v4 -> v5: widen strategy check to ('A','B','C').
                 # v5 -> v6: widen strategy check to ('A','B','C','D').

@@ -46,6 +46,14 @@
         'bg-amber-500':  status.indicator === 'amber',
         'bg-rose-600':   status.indicator === 'red',
       }" class="pill text-slate-950 font-semibold">{{ status.indicator || '...' }}</span>
+      <button @click="toggleBot(!status.bot_enabled)"
+        :class="status.bot_enabled
+          ? 'bg-emerald-900 border-emerald-700 text-emerald-200'
+          : 'bg-rose-900 border-rose-700 text-rose-100'"
+        class="pill border font-semibold px-3 py-1 hover:brightness-125 transition"
+        :title="status.bot_enabled ? 'Click to pause all trading' : 'Click to resume trading'">
+        {{ status.bot_enabled ? '● TRADING' : '⏸ PAUSED' }}
+      </button>
       <span class="text-xs text-slate-500">uptime {{ fmtUptime(status.uptime_secs) }}</span>
       <span v-if="status.paused_reason" class="text-xs text-rose-400">paused: {{ status.paused_reason }}</span>
     </div>
@@ -469,6 +477,171 @@
       </div>
     </section>
 
+    <!-- BACKTEST -->
+    <section v-if="tab === 'backtest'" class="space-y-4">
+      <div class="card p-3 sm:p-4 space-y-2">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">About</div>
+        <div class="text-xs text-slate-400 leading-relaxed">
+          Simulates "if we'd copied these leaders with these filters, what would P&amp;L have been?"
+          Uses Polymarket historical trades + market resolutions from our DB.
+          <span class="text-amber-400">Limits:</span> uses leader fill price as our entry (approximation),
+          assumes "hold to resolution" exits, does not simulate the trailing-stop monitor.
+        </div>
+      </div>
+
+      <!-- Preset loader for backtest configs -->
+      <div class="card p-3 sm:p-4 flex flex-wrap items-center gap-2">
+        <div class="text-xs text-slate-500 uppercase tracking-wider mr-2">Backtest Presets</div>
+        <select class="input" v-model="btPresetSelected">
+          <option value="">— load preset —</option>
+          <option v-for="p in presetsBacktest" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
+        <button class="btn" @click="loadBtPreset(btPresetSelected)" :disabled="!btPresetSelected">Load</button>
+        <button class="btn" @click="deletePreset(btPresetSelected)" :disabled="!btPresetSelected">Delete</button>
+        <input class="input" placeholder="new preset name" v-model="btPresetNewName" style="width: 180px" />
+        <button class="btn btn-pri" @click="savePreset('backtest')" :disabled="!btPresetNewName">Save current</button>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
+        <!-- Parameters -->
+        <div class="card p-4 space-y-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Leaders</div>
+          <label class="block text-sm">Leaderboard window
+            <select class="input w-full mt-1" v-model="btDraft.window">
+              <option value="7d">7d</option>
+              <option value="30d">30d</option>
+              <option value="90d">90d</option>
+              <option value="all">all-time</option>
+            </select>
+          </label>
+          <label class="block text-sm"># leaders
+            <input class="input w-full mt-1" type="number" v-model.number="btDraft.num_leaders" />
+          </label>
+          <label class="block text-sm">Trade limit per leader
+            <input class="input w-full mt-1" type="number" v-model.number="btDraft.trade_limit" />
+          </label>
+          <label class="block text-sm">Custom wallets (comma-separated, overrides leaderboard)
+            <textarea class="input w-full mt-1" rows="2" v-model="btDraft.wallets_raw" placeholder="0x...,0x..."></textarea>
+          </label>
+        </div>
+
+        <div class="card p-4 space-y-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Filters to compare</div>
+          <div class="text-xs text-slate-500">Each row = one filter variant. Results show side-by-side.</div>
+          <div v-for="(f, i) in btDraft.filters" :key="i" class="border border-slate-800 rounded p-2 space-y-2">
+            <div class="flex items-center gap-2">
+              <input class="input flex-1" type="text" placeholder="name" v-model="f.name" />
+              <button class="btn" @click="btDraft.filters.splice(i, 1)" :disabled="btDraft.filters.length <= 1">✕</button>
+            </div>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+              <label>Min entry
+                <input class="input w-full mt-1" type="number" step="0.01" v-model.number="f.min_entry_price" />
+              </label>
+              <label>Max entry
+                <input class="input w-full mt-1" type="number" step="0.01" v-model.number="f.max_entry_price" />
+              </label>
+              <label>Min leader bet ($)
+                <input class="input w-full mt-1" type="number" step="10" v-model.number="f.min_leader_bet_usdc" />
+              </label>
+              <label>Consensus leaders
+                <input class="input w-full mt-1" type="number" v-model.number="f.consensus_leaders" />
+              </label>
+              <label>Consensus window (s)
+                <input class="input w-full mt-1" type="number" v-model.number="f.consensus_window_secs" />
+              </label>
+              <label>Require category
+                <input class="input w-full mt-1" type="text" v-model="f.require_category" placeholder="e.g. sports" />
+              </label>
+              <label class="col-span-2 flex items-center gap-2">
+                <input type="checkbox" v-model="f.inverse" /> Inverse (bet opposite)
+              </label>
+            </div>
+          </div>
+          <button class="btn" @click="btDraft.filters.push({name: 'variant ' + (btDraft.filters.length + 1), min_entry_price: 0, max_entry_price: 1, min_leader_bet_usdc: 0, consensus_leaders: 1, consensus_window_secs: 1800, require_category: '', inverse: false})">+ Add variant</button>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <button class="btn btn-pri" @click="runBacktest" :disabled="btLoading">
+          {{ btLoading ? 'Running...' : 'Run Backtest' }}
+        </button>
+        <span v-if="btResults.meta" class="text-xs text-slate-500">
+          {{ btResults.meta.wallets }} wallets · {{ btResults.meta.fetched }} fetched + {{ btResults.meta.cached }} cached
+        </span>
+        <span v-if="btMsg" class="text-xs" :class="btMsg.startsWith('✓') ? 'text-emerald-400' : 'text-rose-400'">{{ btMsg }}</span>
+      </div>
+
+      <!-- Results -->
+      <div v-if="btResults.results && btResults.results.length > 0" class="card p-3 sm:p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Results</div>
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th>Variant</th>
+              <th class="text-right">Trades</th>
+              <th class="text-right">Wins</th>
+              <th class="text-right">Win %</th>
+              <th class="text-right">Total P&L</th>
+              <th class="text-right">Skipped</th>
+              <th class="text-right">Unresolved</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in btResults.results" :key="r.name">
+              <td class="text-slate-300">{{ r.name }}</td>
+              <td class="text-right num">{{ r.trades }}</td>
+              <td class="text-right num">{{ r.wins }}</td>
+              <td class="text-right num" :class="r.win_rate >= 0.4 ? 'text-emerald-400' : 'text-rose-400'">
+                {{ (r.win_rate * 100).toFixed(1) }}%
+              </td>
+              <td class="text-right num font-semibold" :class="r.total_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+                ${{ fmt(r.total_pnl, 2) }}
+              </td>
+              <td class="text-right num text-slate-500">{{ r.skipped }}</td>
+              <td class="text-right num text-slate-500">{{ r.unresolved }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="mt-3 flex gap-2 flex-wrap">
+          <button class="btn btn-pri" @click="applyBtToLive">Copy first variant → Live config</button>
+          <span class="text-xs text-slate-500 self-center">
+            Applies filter parameters to the live bot. Config is updated via the normal config endpoint.
+          </span>
+        </div>
+      </div>
+
+      <!-- Per-leader detail for first variant -->
+      <div v-if="btResults.per_leader && Object.keys(btResults.per_leader).length > 0" class="card p-3 sm:p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Per-leader breakdown (first variant)</div>
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th>Leader</th>
+              <th class="text-right">Trades</th>
+              <th class="text-right">Wins</th>
+              <th class="text-right">Win %</th>
+              <th class="text-right">P&L</th>
+              <th class="text-right">Skipped</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(s, wallet) in btResults.per_leader" :key="wallet">
+              <td class="text-slate-300">{{ s.pseudonym }} <span class="text-slate-600 text-xs num">{{ wallet.slice(0, 8) }}…</span></td>
+              <td class="text-right num">{{ s.trades }}</td>
+              <td class="text-right num">{{ s.wins }}</td>
+              <td class="text-right num" :class="(s.trades > 0 && (s.wins / s.trades) >= 0.4) ? 'text-emerald-400' : 'text-rose-400'">
+                {{ s.trades > 0 ? (s.wins / s.trades * 100).toFixed(0) + '%' : '—' }}
+              </td>
+              <td class="text-right num font-semibold" :class="s.total_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+                ${{ fmt(s.total_pnl, 2) }}
+              </td>
+              <td class="text-right num text-slate-500">{{ s.skipped }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- DEPENDENCY GRAPH -->
     <section v-if="tab === 'graph'" class="space-y-3">
       <div class="flex gap-2 sm:gap-3 items-center flex-wrap">
@@ -662,43 +835,209 @@
     </section>
 
     <!-- CONFIG -->
-    <section v-if="tab === 'config'" class="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
-      <div class="card p-4 space-y-3">
-        <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy A — UMA</div>
-        <label class="block text-sm">Deploy rate
-          <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_a_deploy_rate" />
-        </label>
-        <label class="block text-sm">Max concurrent
-          <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_a_max_concurrent" />
-        </label>
-        <label class="block text-sm">Bid price
-          <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_a_bid_price" />
-        </label>
+    <section v-if="tab === 'config'" class="space-y-4">
+      <!-- Config presets -->
+      <div class="card p-3 sm:p-4 flex flex-wrap items-center gap-2">
+        <div class="text-xs text-slate-500 uppercase tracking-wider mr-2">Presets</div>
+        <select class="input" v-model="presetSelected">
+          <option value="">— load preset —</option>
+          <option v-for="p in presetsLive" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
+        <button class="btn" @click="applyPreset(presetSelected)" :disabled="!presetSelected">Load</button>
+        <button class="btn" @click="deletePreset(presetSelected)" :disabled="!presetSelected">Delete</button>
+        <input class="input" placeholder="new preset name" v-model="presetNewName" style="width: 180px" />
+        <button class="btn btn-pri" @click="savePreset('live')" :disabled="!presetNewName">Save current</button>
+        <span v-if="presetMsg" class="text-xs text-emerald-400">{{ presetMsg }}</span>
       </div>
-      <div class="card p-4 space-y-3">
-        <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy B — Cascade</div>
-        <label class="block text-sm">Deploy rate
-          <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_b_deploy_rate" />
-        </label>
-        <label class="block text-sm">Max position
-          <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_b_max_position" />
-        </label>
-        <label class="block text-sm">Bid price
-          <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_b_bid_price" />
-        </label>
-      </div>
-      <div class="card p-4 space-y-3 md:col-span-2">
-        <div class="text-xs text-slate-500 uppercase tracking-wider">Capital</div>
-        <label class="block text-sm">Gain pool split: <span class="num">{{ fmt(draft.gain_pool_split, 2) }}</span>
-          <input class="w-full mt-1" type="range" step="0.01" min="0" max="1" v-model.number="draft.gain_pool_split" />
-        </label>
-        <label class="block text-sm">Pause threshold (USDC)
-          <input class="input w-full mt-1" type="number" step="1" v-model.number="draft.trading_pool_pause_threshold" />
-        </label>
-        <label class="block text-sm">Min order size (USDC)
-          <input class="input w-full mt-1" type="number" step="0.5" v-model.number="draft.min_order_size" />
-        </label>
-        <button class="btn btn-pri" @click="saveConfig">Save Config</button>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
+        <div class="card p-4 space-y-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy A — UMA</div>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.strategy_a_enabled" /> Enabled
+          </label>
+          <label class="block text-sm">Deploy rate
+            <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_a_deploy_rate" />
+          </label>
+          <label class="block text-sm">Max concurrent
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_a_max_concurrent" />
+          </label>
+          <label class="block text-sm">Bid price
+            <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_a_bid_price" />
+          </label>
+        </div>
+        <div class="card p-4 space-y-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy B — Cascade</div>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.strategy_b_enabled" /> Enabled
+          </label>
+          <label class="block text-sm">Deploy rate
+            <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_b_deploy_rate" />
+          </label>
+          <label class="block text-sm">Max position
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_b_max_position" />
+          </label>
+          <label class="block text-sm">Bid price
+            <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_b_bid_price" />
+          </label>
+        </div>
+        <div class="card p-4 space-y-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy C — Pre-Proposal</div>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.strategy_c_enabled" /> Enabled
+          </label>
+          <label class="block text-sm">Deploy rate
+            <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_c_deploy_rate" />
+          </label>
+          <label class="block text-sm">Max concurrent
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_c_max_concurrent" />
+          </label>
+          <label class="block text-sm">Max position (USDC)
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_c_max_position" />
+          </label>
+          <label class="block text-sm">Hours to resolution
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_c_hours_to_resolution" />
+          </label>
+          <label class="block text-sm">Entry price min
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_c_entry_price_min" />
+          </label>
+          <label class="block text-sm">Entry price max
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_c_entry_price_max" />
+          </label>
+          <label class="block text-sm">Min 24h volume
+            <input class="input w-full mt-1" type="number" step="10" v-model.number="draft.strategy_c_min_volume_24h" />
+          </label>
+        </div>
+        <div class="card p-4 space-y-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Strategy D — Copy Trading</div>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.strategy_d_enabled" /> Enabled
+          </label>
+          <label class="block text-sm">Deploy rate
+            <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_d_deploy_rate" />
+          </label>
+          <label class="block text-sm">Max position (USDC)
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_max_position" />
+          </label>
+          <label class="block text-sm">Leaderboard window
+            <select class="input w-full mt-1" v-model="draft.strategy_d_leaderboard_window">
+              <option value="7d">7d (noisiest)</option>
+              <option value="30d">30d (recommended)</option>
+              <option value="90d">90d</option>
+              <option value="all">all-time</option>
+            </select>
+          </label>
+          <label class="block text-sm"># leaders to follow
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_num_leaders" />
+          </label>
+          <label class="block text-sm">Min leader history (trades)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_min_leader_history" />
+          </label>
+          <label class="block text-sm">Max leader idle (hours)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_max_leader_idle_hours" />
+          </label>
+          <label class="block text-sm">Consensus leaders (1 = off)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_consensus_leaders" />
+          </label>
+          <label class="block text-sm">Consensus window (secs)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_consensus_window_secs" />
+          </label>
+          <label class="block text-sm">Min leader bet (USDC)
+            <input class="input w-full mt-1" type="number" step="10" v-model.number="draft.strategy_d_min_leader_bet_usdc" />
+          </label>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.strategy_d_size_scale_by_bet" /> Scale size by leader bet
+          </label>
+          <label class="block text-sm">Min entry price
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_min_entry_price" />
+          </label>
+          <label class="block text-sm">Max entry price
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_max_entry_price" />
+          </label>
+          <label class="block text-sm">Max upward slippage
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_max_price_slippage" />
+          </label>
+          <label class="block text-sm">Max slippage abs ($)
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_max_price_slippage_abs" />
+          </label>
+          <label class="block text-sm">Max downward drift (pct below leader)
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_max_price_downward" />
+          </label>
+          <label class="block text-sm">Copy window (secs)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_copy_window_secs" />
+          </label>
+          <label class="block text-sm">Poll interval (secs)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_poll_secs" />
+          </label>
+          <label class="block text-sm">Leader min settled trades
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_leader_min_trades" />
+          </label>
+          <label class="block text-sm">Leader min win rate
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_leader_min_win_rate" />
+          </label>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.strategy_d_category_filter_enabled" /> Category filter
+          </label>
+          <label class="block text-sm">Category min trades
+            <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_d_category_min_trades" />
+          </label>
+          <label class="block text-sm">Category min win rate
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_category_min_win_rate" />
+          </label>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.strategy_d_inverse_copy" />
+            <span class="text-amber-400">Inverse copy (bet OPPOSITE of leaders)</span>
+          </label>
+        </div>
+
+        <div class="card p-4 space-y-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Position Monitor</div>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.monitor_enabled" /> Enabled
+          </label>
+          <label class="block text-sm">Poll (secs)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.monitor_poll_secs" />
+          </label>
+          <label class="block text-sm">Max loss pct
+            <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.monitor_max_loss_pct" />
+          </label>
+          <label class="block text-sm">Timeout (hours)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.monitor_timeout_hours" />
+          </label>
+          <label class="block text-sm">Timeout min multiple
+            <input class="input w-full mt-1" type="number" step="0.1" v-model.number="draft.monitor_timeout_min_multiple" />
+          </label>
+          <label class="block text-sm">Pre-resolution (hours)
+            <input class="input w-full mt-1" type="number" step="0.1" v-model.number="draft.monitor_pre_resolution_hours" />
+          </label>
+          <label class="block text-sm">Confirm polls (dwell)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.monitor_confirm_polls" />
+          </label>
+          <label class="block text-sm">Min hold (secs)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.monitor_min_hold_secs" />
+          </label>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" v-model="draft.monitor_trader_exit_enabled" /> Trader-exit signal
+          </label>
+          <label class="block text-sm">Trader-exit window (min)
+            <input class="input w-full mt-1" type="number" v-model.number="draft.monitor_trader_exit_window_min" />
+          </label>
+        </div>
+
+        <div class="card p-4 space-y-3 md:col-span-2">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Capital</div>
+          <label class="block text-sm">Gain pool split: <span class="num">{{ fmt(draft.gain_pool_split, 2) }}</span>
+            <input class="w-full mt-1" type="range" step="0.01" min="0" max="1" v-model.number="draft.gain_pool_split" />
+          </label>
+          <label class="block text-sm">Pause threshold (USDC)
+            <input class="input w-full mt-1" type="number" step="1" v-model.number="draft.trading_pool_pause_threshold" />
+          </label>
+          <label class="block text-sm">Min order size (USDC)
+            <input class="input w-full mt-1" type="number" step="0.5" v-model.number="draft.min_order_size" />
+          </label>
+          <button class="btn btn-pri" @click="saveConfig">Save Config</button>
+          <span v-if="saveMsg" class="text-xs ml-3" :class="saveMsg.startsWith('✓') ? 'text-emerald-400' : 'text-rose-400'">{{ saveMsg }}</span>
+        </div>
       </div>
     </section>
 
@@ -721,7 +1060,7 @@ const { createApp, reactive, ref, onMounted, computed, watch } = Vue;
 createApp({
   setup() {
     const tab = ref('overview');
-    const tabs = ['overview', 'portfolio', 'upcoming', 'leaders', 'strategy d', 'graph', 'positions', 'history', 'capital', 'config', 'events'];
+    const tabs = ['overview', 'portfolio', 'upcoming', 'leaders', 'strategy d', 'backtest', 'graph', 'positions', 'history', 'capital', 'config', 'events'];
     const secret = ref(localStorage.getItem('latentbot.secret') || '');
     const saveSecret = () => localStorage.setItem('latentbot.secret', secret.value);
 
@@ -745,6 +1084,30 @@ createApp({
     const leaders = ref([]);
     const leadersMeta = reactive({});
     const dStats = reactive({});
+    const presetsLive = ref([]);
+    const presetsBacktest = ref([]);
+    const presetSelected = ref('');
+    const presetNewName = ref('');
+    const presetMsg = ref('');
+    const saveMsg = ref('');
+
+    // Backtest state
+    const btPresetSelected = ref('');
+    const btPresetNewName = ref('');
+    const btLoading = ref(false);
+    const btMsg = ref('');
+    const btDraft = reactive({
+      window: '30d',
+      num_leaders: 10,
+      trade_limit: 500,
+      wallets_raw: '',
+      filters: [
+        { name: 'baseline', min_entry_price: 0, max_entry_price: 1, min_leader_bet_usdc: 0, consensus_leaders: 1, consensus_window_secs: 1800, require_category: '', inverse: false },
+        { name: 'consensus 2', min_entry_price: 0, max_entry_price: 1, min_leader_bet_usdc: 0, consensus_leaders: 2, consensus_window_secs: 1800, require_category: '', inverse: false },
+        { name: 'bet ≥ $500', min_entry_price: 0, max_entry_price: 1, min_leader_bet_usdc: 500, consensus_leaders: 1, consensus_window_secs: 1800, require_category: '', inverse: false },
+      ],
+    });
+    const btResults = reactive({ results: [], per_leader: {}, meta: null });
     const portfolio = reactive({ positions: [], totals: {} });
     const withdrawAmount = ref('');
 
@@ -984,22 +1347,31 @@ createApp({
       Object.assign(history, r);
     };
 
+    // Fields the API masks — never ship these back from the draft form.
+    const SENSITIVE_FIELDS = new Set([
+      'private_key', 'dashboard_secret',
+      'polymarket_proxy_address', 'polygon_rpc_url',
+      'db_path', 'signature_type', 'dashboard_host', 'dashboard_port',
+    ]);
+
     const saveConfig = async () => {
+      // Build payload from all editable draft keys. Any key whose value
+      // is a string/number/bool becomes an env var via upper-case conversion.
+      const payload = {};
+      for (const [k, v] of Object.entries(draft)) {
+        if (v === undefined || v === null) continue;
+        if (SENSITIVE_FIELDS.has(k)) continue;
+        payload[k.toUpperCase()] = v;
+      }
       try {
-        await postJson('/api/config', {
-          STRATEGY_A_DEPLOY_RATE: draft.strategy_a_deploy_rate,
-          STRATEGY_A_MAX_CONCURRENT: draft.strategy_a_max_concurrent,
-          STRATEGY_A_BID_PRICE: draft.strategy_a_bid_price,
-          STRATEGY_B_DEPLOY_RATE: draft.strategy_b_deploy_rate,
-          STRATEGY_B_MAX_POSITION: draft.strategy_b_max_position,
-          STRATEGY_B_BID_PRICE: draft.strategy_b_bid_price,
-          GAIN_POOL_SPLIT: draft.gain_pool_split,
-          TRADING_POOL_PAUSE_THRESHOLD: draft.trading_pool_pause_threshold,
-          MIN_ORDER_SIZE: draft.min_order_size,
-        });
+        await postJson('/api/config', payload);
         localStorage.setItem('latentbot.secret', secret.value);
+        saveMsg.value = '✓ saved';
+        setTimeout(() => saveMsg.value = '', 2000);
         await refreshAll();
-      } catch (e) { alert('save failed: ' + e.message); }
+      } catch (e) {
+        saveMsg.value = '✗ ' + e.message;
+      }
     };
 
     const toggleStrategy = async (s, enabled) => {
@@ -1007,6 +1379,138 @@ createApp({
         await postJson('/api/strategy/toggle', { strategy: s, enabled });
         await refreshAll();
       } catch (e) { alert(e.message); }
+    };
+
+    const toggleBot = async (enabled) => {
+      if (!enabled && !confirm('Pause all trading? Positions will still be monitored but no new trades will open.')) return;
+      try {
+        await postJson('/api/bot/toggle', { enabled });
+        await refreshAll();
+      } catch (e) { alert(e.message); }
+    };
+
+    const loadPresets = async () => {
+      try {
+        const live = await getJson('/api/config/presets?scope=live');
+        const bt = await getJson('/api/config/presets?scope=backtest');
+        presetsLive.value = live.presets || [];
+        presetsBacktest.value = bt.presets || [];
+      } catch (e) { /* silent */ }
+    };
+
+    const savePreset = async (scope) => {
+      try {
+        const params = scope === 'live' ? { ...draft } : { ...btDraft };
+        await postJson('/api/config/presets', {
+          name: presetNewName.value,
+          scope,
+          params,
+        });
+        presetMsg.value = '✓ saved';
+        setTimeout(() => presetMsg.value = '', 2000);
+        presetNewName.value = '';
+        await loadPresets();
+      } catch (e) { presetMsg.value = '✗ ' + e.message; }
+    };
+
+    const applyPreset = async (id) => {
+      if (!id) return;
+      try {
+        await postJson(`/api/config/presets/${id}/apply`, {});
+        presetMsg.value = '✓ applied — restart may be needed';
+        setTimeout(() => presetMsg.value = '', 3000);
+        await refreshAll();
+      } catch (e) { presetMsg.value = '✗ ' + e.message; }
+    };
+
+    const deletePreset = async (id) => {
+      if (!id || !confirm('Delete this preset?')) return;
+      try {
+        const headers = { 'X-Auth': secret.value };
+        const r = await fetch(`/api/config/presets/${id}`, { method: 'DELETE', headers });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        presetSelected.value = '';
+        btPresetSelected.value = '';
+        await loadPresets();
+      } catch (e) { alert(e.message); }
+    };
+
+    const loadBtPreset = async (id) => {
+      if (!id) return;
+      const preset = presetsBacktest.value.find(p => p.id === id);
+      if (!preset) return;
+      try {
+        // Fetch full preset params via GET list (already loaded) — but we
+        // need the params blob which isn't in the list endpoint. Use apply
+        // is for live only; for backtest we just need to read params.
+        // Quick workaround: the list endpoint includes enough; to get the
+        // full blob we'd need a dedicated GET. For now request via apply
+        // check would be bad. Reload list with full params.
+        const r = await fetch(`/api/config/presets?scope=backtest&full=1`, {
+          headers: { 'X-Auth': secret.value },
+        });
+        const d = await r.json();
+        const full = (d.presets || []).find(p => p.id === id);
+        if (!full || !full.params) {
+          alert('Preset payload missing — saving presets with params requires the backend to return params in the list response.');
+          return;
+        }
+        Object.assign(btDraft, full.params);
+      } catch (e) { alert(e.message); }
+    };
+
+    const runBacktest = async () => {
+      btLoading.value = true;
+      btMsg.value = '';
+      try {
+        const body = {
+          leaders: {
+            window: btDraft.window,
+            num_leaders: btDraft.num_leaders,
+            trade_limit: btDraft.trade_limit,
+            wallets: btDraft.wallets_raw
+              ? btDraft.wallets_raw.split(',').map(s => s.trim()).filter(Boolean)
+              : [],
+          },
+          filters: btDraft.filters.map(f => ({
+            name: f.name || 'variant',
+            min_entry_price: f.min_entry_price ?? 0,
+            max_entry_price: f.max_entry_price ?? 1,
+            min_leader_bet_usdc: f.min_leader_bet_usdc ?? 0,
+            consensus_leaders: f.consensus_leaders ?? 1,
+            consensus_window_secs: f.consensus_window_secs ?? 1800,
+            require_category: f.require_category || null,
+            inverse: !!f.inverse,
+          })),
+        };
+        const r = await postJson('/api/backtest/run', body);
+        Object.assign(btResults, r);
+        btMsg.value = '✓ ran ' + r.results.length + ' variants';
+      } catch (e) {
+        btMsg.value = '✗ ' + e.message;
+      } finally {
+        btLoading.value = false;
+      }
+    };
+
+    const applyBtToLive = async () => {
+      if (!btDraft.filters[0]) return;
+      const f = btDraft.filters[0];
+      if (!confirm(`Apply "${f.name}" filter params to LIVE config?`)) return;
+      try {
+        await postJson('/api/config', {
+          STRATEGY_D_MIN_ENTRY_PRICE: f.min_entry_price ?? 0,
+          STRATEGY_D_MAX_ENTRY_PRICE: f.max_entry_price ?? 1,
+          STRATEGY_D_MIN_LEADER_BET_USDC: f.min_leader_bet_usdc ?? 0,
+          STRATEGY_D_CONSENSUS_LEADERS: f.consensus_leaders ?? 1,
+          STRATEGY_D_CONSENSUS_WINDOW_SECS: f.consensus_window_secs ?? 1800,
+          STRATEGY_D_INVERSE_COPY: !!f.inverse,
+        });
+        btMsg.value = '✓ applied to live — may need restart';
+        await refreshAll();
+      } catch (e) {
+        btMsg.value = '✗ ' + e.message;
+      }
     };
 
     const withdraw = async () => {
@@ -1044,6 +1548,8 @@ createApp({
       if (t === 'leaders') loadLeaders();
       if (t === 'portfolio') loadPortfolio();
       if (t === 'strategy d') loadStrategyDStats();
+      if (t === 'config') loadPresets();
+      if (t === 'backtest') { loadPresets(); }
     });
 
     onMounted(async () => {
@@ -1068,7 +1574,11 @@ createApp({
       dStats, loadStrategyDStats,
       portfolio, loadPortfolio,
       fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl,
-      loadHistory, saveConfig, toggleStrategy, withdraw,
+      loadHistory, saveConfig, toggleStrategy, toggleBot, withdraw,
+      presetsLive, presetsBacktest, presetSelected, presetNewName, presetMsg,
+      savePreset, applyPreset, deletePreset, saveMsg,
+      btDraft, btResults, btLoading, btMsg, btPresetSelected, btPresetNewName,
+      runBacktest, applyBtToLive, loadBtPreset,
     };
   }
 }).mount('#app');
