@@ -138,22 +138,107 @@ def _parse_json_array(v):
     return []
 
 
+async def _try_gamma_fetch(
+    session: aiohttp.ClientSession, params, attempt: str,
+) -> Optional[list]:
+    """Helper to call gamma and return parsed entries or None on failure."""
+    try:
+        async with session.get(GAMMA_URL, params=params) as r:
+            body = await r.text()
+            if r.status != 200:
+                log.warning(
+                    "gamma [%s] HTTP %d: %s",
+                    attempt, r.status, body[:200],
+                )
+                return None
+            import json as _json
+            try:
+                data = _json.loads(body)
+            except Exception as e:
+                log.warning("gamma [%s] bad JSON: %s", attempt, e)
+                return None
+    except Exception as e:
+        log.warning("gamma [%s] request failed: %s", attempt, e)
+        return None
+    entries = data if isinstance(data, list) else (
+        data.get("data") if isinstance(data, dict) else None
+    ) or []
+    return entries
+
+
+async def _persist_resolution(
+    db, tok_str: str, outcome_index: int, winner_idx: int,
+    condition_id: str, question: str, now: int,
+) -> None:
+    """Upsert a resolved market row. `winner_idx` is the winning outcome
+    (0 or 1); `outcome_index` is THIS token's outcome position."""
+    row = await db.fetchone(
+        "SELECT token_id, outcome_index FROM markets WHERE token_id = ?",
+        (tok_str,),
+    )
+    if row:
+        oi = row["outcome_index"]
+        if oi is None:
+            oi = outcome_index
+        await db.execute(
+            "UPDATE markets SET status = 'resolved', "
+            "resolved_outcome = ?, outcome_index = ?, updated_at = ? "
+            "WHERE token_id = ?",
+            (winner_idx, oi, now, tok_str),
+        )
+    else:
+        await db.execute(
+            "INSERT OR IGNORE INTO markets "
+            "(token_id, condition_id, question, status, "
+            " outcome_index, resolved_outcome, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'resolved', ?, ?, ?, ?)",
+            (tok_str, condition_id or "",
+             question or "(backfilled)", outcome_index, winner_idx,
+             now, now),
+        )
+
+
+def _market_winner(m: dict) -> Optional[int]:
+    """Given a gamma market row, return winning outcome index (0/1) if
+    resolved, else None. Accepts any of:
+      - `closed: true` + clear outcomePrices
+      - `resolvedOutcomeId` / explicit resolution fields
+    We also accept markets where outcomePrices are unambiguous (>=0.99
+    on one side, <=0.01 on the other) even if the closed flag isn't set,
+    because gamma occasionally lags its own close flag.
+    """
+    prices = _parse_json_array(m.get("outcomePrices"))
+    if len(prices) != 2:
+        return None
+    try:
+        p0, p1 = float(prices[0]), float(prices[1])
+    except (TypeError, ValueError):
+        return None
+    if p1 >= 0.99 and p0 <= 0.01:
+        return 1
+    if p0 >= 0.99 and p1 <= 0.01:
+        return 0
+    return None
+
+
 async def backfill_resolutions(
-    db, token_ids: list[str], batch_size: int = 30,
+    db, token_ids: list[str], batch_size: int = 50,
 ) -> dict[str, int]:
     """For any token in `token_ids` whose market isn't resolved in our DB,
     query gamma-api for current resolution state and update the DB.
     Returns {token_id: winner_flag (0 or 1)} for all tokens we could resolve.
 
-    Winner flag semantics: 1 = this specific token won, 0 = this specific
-    token lost — matching what run_sim expects.
+    Strategy: try multiple gamma query shapes since its filter semantics
+    aren't perfectly documented. Batches reduce the total HTTP count.
+
+    Winner flag semantics: 1 = this specific token won, 0 = lost.
     """
     import time
-    # Pull existing DB state so we skip tokens we already know about.
-    known: dict[str, Optional[int]] = {}
     if not token_ids:
         return {}
-    # Chunk DB query to avoid huge IN clauses.
+
+    # 1) Pull existing DB state so we skip tokens we already know about.
+    known: dict[str, Optional[int]] = {}
     for i in range(0, len(token_ids), 500):
         chunk = token_ids[i:i + 500]
         qs = ",".join("?" for _ in chunk)
@@ -171,105 +256,110 @@ async def backfill_resolutions(
                 known[r["token_id"]] = None
 
     need_fetch = [t for t in token_ids if known.get(t) is None]
+    resolutions: dict[str, int] = {k: v for k, v in known.items() if v is not None}
     if not need_fetch:
-        return {k: v for k, v in known.items() if v is not None}
+        log.info("backfill_resolutions: all %d tokens already resolved in DB",
+                 len(token_ids))
+        return resolutions
 
     log.info(
-        "backfill_resolutions: need to fetch %d / %d tokens from gamma",
-        len(need_fetch), len(token_ids),
+        "backfill_resolutions: %d/%d tokens already known; fetching %d from gamma",
+        len(resolutions), len(token_ids), len(need_fetch),
     )
 
-    resolutions: dict[str, int] = {k: v for k, v in known.items() if v is not None}
+    need_set = set(need_fetch)
     now = int(time.time())
+    fetched_total = 0
+    matched_total = 0
 
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for chunk_start in range(0, len(need_fetch), batch_size):
             chunk = need_fetch[chunk_start:chunk_start + batch_size]
-            # gamma accepts clob_token_ids as a repeated param. We send as
-            # comma-joined per API convention; some gamma endpoints want
-            # the param repeated. If comma-join doesn't work we fall back.
-            params = [("clob_token_ids", tid) for tid in chunk]
-            params.append(("limit", str(batch_size * 2)))
-            try:
-                async with session.get(GAMMA_URL, params=params) as r:
-                    if r.status != 200:
-                        log.warning("gamma resolution HTTP %d", r.status)
-                        continue
-                    data = await r.json()
-            except Exception as e:
-                log.warning("gamma fetch failed: %s", e)
+
+            # Try three query shapes in order — gamma's filter semantics
+            # aren't well-documented and different fields work for
+            # different deployments.
+            candidates = [
+                # A) repeated params + closed=true (most explicit for resolved)
+                ([("clob_token_ids", tid) for tid in chunk]
+                 + [("closed", "true"), ("limit", str(batch_size * 2))],
+                 "repeated+closed=true"),
+                # B) repeated params, no closed filter (gamma returns both)
+                ([("clob_token_ids", tid) for tid in chunk]
+                 + [("limit", str(batch_size * 2))],
+                 "repeated+nofilter"),
+                # C) comma-joined single param
+                ({"clob_token_ids": ",".join(chunk),
+                  "closed": "true",
+                  "limit": str(batch_size * 2)},
+                 "comma+closed=true"),
+            ]
+
+            entries = None
+            used_attempt = None
+            for params, attempt in candidates:
+                entries = await _try_gamma_fetch(session, params, attempt)
+                if entries is None:
+                    continue
+                fetched_total += len(entries)
+                # Check if ANY of the returned entries actually contains
+                # one of our target tokens — if not, this query shape
+                # didn't actually filter by token and we should try next.
+                matches = 0
+                for m in entries:
+                    toks = _parse_json_array(
+                        m.get("clobTokenIds") or m.get("clob_token_ids")
+                    )
+                    if any(str(t) in need_set for t in toks):
+                        matches += 1
+                if matches > 0:
+                    used_attempt = attempt
+                    log.info(
+                        "gamma [%s] returned %d entries, %d matched chunk",
+                        attempt, len(entries), matches,
+                    )
+                    break
+                else:
+                    log.info(
+                        "gamma [%s] returned %d entries but 0 matched — trying next",
+                        attempt, len(entries),
+                    )
+                    entries = None
+
+            if not entries:
+                log.warning(
+                    "gamma: no usable response for chunk %d-%d (size %d); skipping",
+                    chunk_start, chunk_start + len(chunk), len(chunk),
+                )
                 continue
 
-            entries = data if isinstance(data, list) else (
-                data.get("data") if isinstance(data, dict) else []
-            )
-            for m in entries or []:
+            for m in entries:
                 tokens = _parse_json_array(
                     m.get("clobTokenIds") or m.get("clob_token_ids")
                 )
-                outcome_prices = _parse_json_array(m.get("outcomePrices"))
-                closed = bool(m.get("closed"))
-                if not tokens or len(tokens) != 2:
+                if len(tokens) != 2:
                     continue
-                # Determine winner: for a closed market, outcomePrices
-                # should be ~[1,0] or ~[0,1]. Require clear dominance so
-                # we don't mis-label markets still being disputed.
-                winner_idx = None
-                if closed and len(outcome_prices) == 2:
-                    try:
-                        p0, p1 = float(outcome_prices[0]), float(outcome_prices[1])
-                    except (TypeError, ValueError):
-                        p0 = p1 = 0.0
-                    if p1 >= 0.99 and p0 <= 0.01:
-                        winner_idx = 1
-                    elif p0 >= 0.99 and p1 <= 0.01:
-                        winner_idx = 0
+                # Only care if at least one token is something we're
+                # tracking — gamma may return adjacent markets.
+                if not any(str(t) in need_set for t in tokens):
+                    continue
+                winner_idx = _market_winner(m)
                 if winner_idx is None:
-                    # Still open or ambiguous — skip.
                     continue
-
-                # Persist into markets table. Each token's outcome_index
-                # might already be set (by seeder) or we set positionally.
+                matched_total += 1
+                cond_id = str(m.get("conditionId") or m.get("condition_id") or "")
+                question = str(m.get("question") or "(backfilled)")
                 for i, tok in enumerate(tokens):
                     tok_str = str(tok)
-                    this_won = 1 if i == winner_idx else 0
-                    resolutions[tok_str] = this_won
-                    # Update DB. Use UPSERT-ish: only set resolved bits,
-                    # don't overwrite fields we don't own.
-                    row = await db.fetchone(
-                        "SELECT token_id, outcome_index FROM markets "
-                        "WHERE token_id = ?", (tok_str,),
+                    resolutions[tok_str] = 1 if i == winner_idx else 0
+                    await _persist_resolution(
+                        db, tok_str, i, winner_idx, cond_id, question, now,
                     )
-                    if row:
-                        oi = row["outcome_index"]
-                        if oi is None:
-                            oi = i
-                        # resolved_outcome = which outcome_index won
-                        await db.execute(
-                            "UPDATE markets SET status = 'resolved', "
-                            "resolved_outcome = ?, outcome_index = ?, "
-                            "updated_at = ? "
-                            "WHERE token_id = ?",
-                            (winner_idx, oi, now, tok_str),
-                        )
-                    else:
-                        # Minimal insert so future backtest can reuse.
-                        await db.execute(
-                            "INSERT OR IGNORE INTO markets "
-                            "(token_id, condition_id, question, status, "
-                            " outcome_index, resolved_outcome, "
-                            " created_at, updated_at) "
-                            "VALUES (?, ?, ?, 'resolved', ?, ?, ?, ?)",
-                            (tok_str,
-                             str(m.get("conditionId") or m.get("condition_id") or ""),
-                             str(m.get("question") or "(backfilled)"),
-                             i, winner_idx, now, now),
-                        )
 
     log.info(
-        "backfill_resolutions: resolved %d / %d (DB rows inserted/updated)",
-        len(resolutions), len(token_ids),
+        "backfill_resolutions: fetched %d entries, resolved %d / %d tokens",
+        fetched_total, len(resolutions), len(token_ids),
     )
     return resolutions
 
