@@ -357,6 +357,26 @@ def create_app(state: StateManager) -> FastAPI:
         return {"ok": True, "gain_pool": new_balance}
 
     # ------------------------------------------------------------------
+    # POST /api/capital/transfer-gain
+    # ------------------------------------------------------------------
+    @app.post("/api/capital/transfer-gain", dependencies=[Depends(require_auth)])
+    async def transfer_gain(body: dict) -> dict:
+        amount = float(body.get("amount", 0))
+        memo = body.get("memo")
+        try:
+            new_gain, new_trading = await pools.transfer_gain_to_trading(
+                amount, memo=memo,
+            )
+        except pools.PoolError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        await state.broadcast(Signal(
+            kind=SignalKind.DASHBOARD_REFRESH,
+            payload={"section": "pools"},
+            source="api",
+        ))
+        return {"ok": True, "gain_pool": new_gain, "trading_pool": new_trading}
+
+    # ------------------------------------------------------------------
     # POST /api/strategy/toggle
     # ------------------------------------------------------------------
     @app.post("/api/strategy/toggle", dependencies=[Depends(require_auth)])

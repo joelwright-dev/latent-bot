@@ -317,6 +317,57 @@ async def record_withdrawal(
         return new_balance
 
 
+async def transfer_gain_to_trading(
+    amount: float,
+    *,
+    db: Optional[Database] = None,
+    memo: Optional[str] = None,
+) -> tuple[float, float]:
+    """Reclassify `amount` USDC from the gain pool to the trading pool.
+
+    No on-chain movement — the USDC already sits in the same wallet; this
+    only updates the internal ledger so the bot treats it as deployable
+    capital. Atomic: both ledger rows commit together or not at all.
+
+    Returns (new_gain_balance, new_trading_balance).
+    """
+    if amount <= 0:
+        raise PoolError("transfer amount must be positive")
+    db = db or get_db()
+    async with db.transaction() as conn:
+        gain_current = await _current_balance(conn, "gain")
+        if gain_current - amount < 0:
+            raise InsufficientFundsError(
+                f"gain pool {gain_current:.2f} cannot cover transfer of {amount:.2f}"
+            )
+        new_gain = gain_current - amount
+        await _append_ledger(
+            conn,
+            pool="gain",
+            event_type="adjustment",
+            amount=-amount,
+            balance_after=new_gain,
+            position_id=None,
+            memo=memo or "transfer to trading pool",
+        )
+        trading_current = await _current_balance(conn, "trading")
+        new_trading = trading_current + amount
+        await _append_ledger(
+            conn,
+            pool="trading",
+            event_type="adjustment",
+            amount=amount,
+            balance_after=new_trading,
+            position_id=None,
+            memo=memo or "transfer from gain pool",
+        )
+    log.info(
+        "transfer_gain_to_trading: amount=%.2f gain=%.2f trading=%.2f",
+        amount, new_gain, new_trading,
+    )
+    return new_gain, new_trading
+
+
 async def record_deposit(
     amount: float,
     pool: str,
