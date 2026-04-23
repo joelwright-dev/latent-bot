@@ -109,6 +109,7 @@ class Config:
     # Defensive tuning: avoids firing on flash dips and freshly-opened
     # positions that haven't had time to find their level yet.
     monitor_confirm_polls: int            # e.g. 3 = require 3 polls below trail before exit
+    monitor_max_loss_confirm_polls: int   # e.g. 2 = require 2 polls below max-loss line (filter single-tick wicks)
     monitor_min_hold_secs: int            # e.g. 300 = skip first 5 min after entry
     # Trader-exit signal: if a copied leader sells their side, we exit too.
     monitor_trader_exit_enabled: bool
@@ -234,6 +235,7 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         monitor_timeout_min_multiple=_f(values.get("MONITOR_TIMEOUT_MIN_MULTIPLE"), 2.0),
         monitor_pre_resolution_hours=_f(values.get("MONITOR_PRE_RESOLUTION_HOURS"), 1.0),
         monitor_confirm_polls=_i(values.get("MONITOR_CONFIRM_POLLS"), 3),
+        monitor_max_loss_confirm_polls=_i(values.get("MONITOR_MAX_LOSS_CONFIRM_POLLS"), 2),
         monitor_min_hold_secs=_i(values.get("MONITOR_MIN_HOLD_SECS"), 300),
         monitor_trader_exit_enabled=_b(values.get("MONITOR_TRADER_EXIT_ENABLED"), True),
         monitor_trader_exit_window_min=_i(values.get("MONITOR_TRADER_EXIT_WINDOW_MIN"), 15),

@@ -85,6 +85,12 @@ class PositionMonitor:
         # fires exit once a position has been below the trail line for
         # MONITOR_CONFIRM_POLLS polls in a row — filters flash dips.
         self._dip_counts: dict[int, int] = {}
+        # Same pattern for the max-loss floor. A single-poll wick to
+        # best_bid (e.g. bid side momentarily thin) shouldn't trigger a
+        # catastrophic-loss exit; require N consecutive polls below the
+        # floor. Shorter default than trailing since real crashes still
+        # need to exit reasonably fast.
+        self._max_loss_counts: dict[int, int] = {}
 
     async def run(self) -> None:
         self._running = True
@@ -123,11 +129,14 @@ class PositionMonitor:
         if not rows:
             return
 
-        # Garbage-collect _dip_counts for positions no longer open.
+        # Garbage-collect dwell counters for positions no longer open.
         live_ids = {r["id"] for r in rows}
         for pid in list(self._dip_counts.keys()):
             if pid not in live_ids:
                 self._dip_counts.pop(pid, None)
+        for pid in list(self._max_loss_counts.keys()):
+            if pid not in live_ids:
+                self._max_loss_counts.pop(pid, None)
 
         # Batch-fetch leader sells once per cycle. Any position whose
         # leader sold the same token in the last N minutes gets flagged
@@ -219,17 +228,26 @@ class PositionMonitor:
             # Reset the counter when price recovers above the trail line.
             self._dip_counts.pop(pos_id, None)
 
-        # 2. Max loss floor (no dwell — catastrophic drops shouldn't wait)
-        if current < entry * (1.0 - cfg.monitor_max_loss_pct):
-            await self._fire_exit(
-                row, current, peak, gain_multiple,
-                reason="max_loss",
-                detail=(
-                    f"price {current:.4f} < entry {entry:.4f} "
-                    f"× {1.0-cfg.monitor_max_loss_pct:.2f}"
-                ),
-            )
-            return
+        # 2. Max loss floor — with short dwell. Best-bid can wick down
+        # for a single poll when the bid side thins briefly; without a
+        # confirm we'd exit on noise. Dwell is shorter than trailing's
+        # because real crashes still need to exit reasonably fast.
+        max_loss_line = entry * (1.0 - cfg.monitor_max_loss_pct)
+        if current < max_loss_line:
+            self._max_loss_counts[pos_id] = self._max_loss_counts.get(pos_id, 0) + 1
+            if self._max_loss_counts[pos_id] >= cfg.monitor_max_loss_confirm_polls:
+                await self._fire_exit(
+                    row, current, peak, gain_multiple,
+                    reason="max_loss",
+                    detail=(
+                        f"price {current:.4f} < floor {max_loss_line:.4f} "
+                        f"(entry {entry:.4f} × {1.0-cfg.monitor_max_loss_pct:.2f}) "
+                        f"for {self._max_loss_counts[pos_id]} polls"
+                    ),
+                )
+                return
+        else:
+            self._max_loss_counts.pop(pos_id, None)
 
         # 3. Time-based exit: stale position that never gained traction
         if age_hours > cfg.monitor_timeout_hours and peak_gain < cfg.monitor_timeout_min_multiple:
