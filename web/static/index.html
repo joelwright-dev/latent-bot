@@ -128,14 +128,15 @@
 
     <!-- POLYMARKET PORTFOLIO -->
     <section v-if="tab === 'portfolio'" class="space-y-4">
+      <div class="text-xs text-slate-500 uppercase tracking-wider">Polymarket view</div>
       <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 sm:gap-4">
         <div class="card p-4">
           <div class="text-xs text-slate-500 uppercase tracking-wider">Portfolio total</div>
           <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.totals?.portfolio_total) }}</div>
-          <div class="text-xs text-slate-500 mt-1">positions + wallet</div>
+          <div class="text-xs text-slate-500 mt-1">positions + cash</div>
         </div>
         <div class="card p-4">
-          <div class="text-xs text-slate-500 uppercase tracking-wider">Wallet USDC</div>
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Cash (on-chain USDC.e)</div>
           <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.totals?.wallet_usdc) }}</div>
           <div class="text-xs text-slate-500 mt-1">free to trade</div>
         </div>
@@ -156,6 +157,33 @@
           <div class="text-xs text-slate-500 uppercase tracking-wider">Max win if all resolve</div>
           <div class="text-2xl font-semibold num mt-1 text-sky-400">${{ fmt(portfolio.totals?.to_win) }}</div>
           <div class="text-xs text-slate-500 mt-1">if every position wins</div>
+        </div>
+      </div>
+
+      <div class="text-xs text-slate-500 uppercase tracking-wider pt-2">Bot internal ledger</div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Trading pool (seeded)</div>
+          <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.bot_pool?.trading_balance) }}</div>
+          <div class="text-xs text-slate-500 mt-1">bot sizes orders off this</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Available to deploy</div>
+          <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.bot_pool?.available_to_deploy) }}</div>
+          <div class="text-xs text-slate-500 mt-1 num">${{ fmt(portfolio.bot_pool?.locked_in_open) }} locked in open</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Gain pool</div>
+          <div class="text-2xl font-semibold num mt-1 text-emerald-400">${{ fmt(portfolio.bot_pool?.gain_balance) }}</div>
+          <div class="text-xs text-slate-500 mt-1">withdrawable profit share</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Ledger vs on-chain delta</div>
+          <div class="text-2xl font-semibold num mt-1"
+               :class="ledgerDelta >= 0 ? 'text-slate-300' : 'text-amber-400'">
+            {{ ledgerDelta >= 0 ? '+' : '' }}${{ fmt(ledgerDelta) }}
+          </div>
+          <div class="text-xs text-slate-500 mt-1">on-chain minus bot-tracked</div>
         </div>
       </div>
 
@@ -1149,7 +1177,18 @@ createApp({
       ],
     });
     const btResults = reactive({ results: [], per_leader: {}, meta: null });
-    const portfolio = reactive({ positions: [], totals: {} });
+    const portfolio = reactive({ positions: [], totals: {}, bot_pool: {} });
+    // Difference between on-chain USDC.e and the bot's ledgered cash
+    // (trading + gain). Positive = user added extra cash that the bot
+    // isn't sizing off. Negative = ledger drift — something off-book
+    // deducted on-chain USDC (external sell, manual withdrawal, etc.).
+    const ledgerDelta = computed(() => {
+      const onChain = portfolio.totals?.wallet_usdc;
+      const ledgered = (portfolio.bot_pool?.trading_balance || 0)
+                     + (portfolio.bot_pool?.gain_balance || 0);
+      if (onChain === null || onChain === undefined) return 0;
+      return onChain - ledgered;
+    });
     const withdrawAmount = ref('');
     const transferAmount = ref('');
     const diagBusy = ref(false);
@@ -1279,6 +1318,7 @@ createApp({
         const d = await getJson('/api/portfolio');
         portfolio.positions = d.positions || [];
         portfolio.totals = d.totals || {};
+        portfolio.bot_pool = d.bot_pool || {};
       } catch (e) { /* ignore */ }
     };
 
@@ -1689,7 +1729,7 @@ createApp({
       leaders, leadersMeta, loadLeaders, fmtAgeDelta,
       dStats, loadStrategyDStats,
       forceRefreshDLeaders, rosterRefreshMsg,
-      portfolio, loadPortfolio,
+      portfolio, loadPortfolio, ledgerDelta,
       fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl,
       loadHistory, saveConfig, toggleStrategy, toggleBot, withdraw, transferGain,
       presetsLive, presetsBacktest, presetSelected, presetNewName, presetMsg,

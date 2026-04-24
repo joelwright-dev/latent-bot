@@ -732,11 +732,52 @@ def create_app(state: StateManager) -> FastAPI:
     # ------------------------------------------------------------------
     # GET /api/portfolio — mirror of Polymarket's positions endpoint
     # ------------------------------------------------------------------
+    # USDC.e (bridged) is what Polymarket actually uses for cash, held
+    # at the proxy wallet on Polygon. We query its balanceOf directly
+    # via the configured Polygon RPC — data-api has no wallet-cash
+    # endpoint (/value returns positions' current value, not cash).
+    USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    ERC20_BALANCE_OF = "0x70a08231"
+
+    async def _fetch_usdc_e_balance(
+        session: aiohttp.ClientSession, wallet: str, rpc_url: str
+    ) -> Optional[float]:
+        if not rpc_url or not wallet:
+            return None
+        addr = wallet[2:].lower() if wallet.startswith("0x") else wallet.lower()
+        call_data = ERC20_BALANCE_OF + addr.rjust(64, "0")
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [
+                {"to": USDC_E_ADDRESS, "data": call_data},
+                "latest",
+            ],
+            "id": 1,
+        }
+        try:
+            async with session.post(rpc_url, json=payload) as r:
+                if r.status != 200:
+                    return None
+                doc = await r.json()
+        except Exception:
+            return None
+        hex_result = (doc or {}).get("result")
+        if not hex_result or not isinstance(hex_result, str):
+            return None
+        try:
+            raw = int(hex_result, 16)
+        except ValueError:
+            return None
+        return raw / 1_000_000.0  # USDC.e has 6 decimals
+
     @app.get("/api/portfolio")
     async def portfolio() -> dict:
         """Fetches the user's current positions directly from
         data-api.polymarket.com and aggregates them into a portfolio
-        view with totals."""
+        view with totals. Wallet cash is fetched on-chain (USDC.e
+        balance at the proxy address) since data-api has no such
+        endpoint."""
         cfg = get_config()
         wallet = cfg.polymarket_proxy_address
         if not wallet:
@@ -757,23 +798,11 @@ def create_app(state: StateManager) -> FastAPI:
                 return {"error": f"positions fetch failed: {e}",
                         "positions": [], "totals": {}}
 
-            # Portfolio value (includes wallet USDC)
-            wallet_usdc = None
-            portfolio_total = None
-            try:
-                async with session.get(
-                    "https://data-api.polymarket.com/value",
-                    params={"user": wallet},
-                ) as r:
-                    if r.status == 200:
-                        v = await r.json()
-                        # Shape: [{"user":"...", "value":123.45}] or dict
-                        if isinstance(v, list) and v:
-                            portfolio_total = float(v[0].get("value") or 0)
-                        elif isinstance(v, dict):
-                            portfolio_total = float(v.get("value") or 0)
-            except Exception:
-                pass
+            # Wallet USDC — direct on-chain read. Falls back to None on
+            # RPC failure; UI renders "—" in that case.
+            wallet_usdc = await _fetch_usdc_e_balance(
+                session, wallet, cfg.polygon_rpc_url,
+            )
 
         # Normalise positions + compute totals
         positions = []
@@ -829,11 +858,34 @@ def create_app(state: StateManager) -> FastAPI:
         # Sort positions by current value descending (biggest exposure first)
         positions.sort(key=lambda x: -x["current_value"])
 
-        # Wallet USDC: if data-api /value gave us a total, subtract
-        # positions' current value to derive wallet USDC. Otherwise leave
-        # null and the dashboard renders a "—".
-        if portfolio_total is not None:
-            wallet_usdc = portfolio_total - total_current
+        # Portfolio total matches Polymarket's portfolio header: positions
+        # market value + cash in the wallet. Cash comes from the on-chain
+        # USDC.e read above. If the RPC fell over we leave it null so the
+        # UI can render "—" rather than a misleading figure.
+        portfolio_total = (
+            total_current + wallet_usdc if wallet_usdc is not None else None
+        )
+
+        # Internal bot pool — the ledger-tracked trading capital. Shown
+        # separately from the on-chain cash because the two aren't the
+        # same thing: on-chain USDC.e includes funds the user may have
+        # added manually that the bot doesn't size trades off.
+        db = get_db()
+        try:
+            trading_pool = await pools.get_trading_balance(db)
+            gain_pool = await pools.get_gain_balance(db)
+            locked_open = await db.fetchval(
+                "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions "
+                "WHERE status = 'open' AND strategy != 'M'"
+            )
+            bot_pool = {
+                "trading_balance": trading_pool,
+                "gain_balance": gain_pool,
+                "locked_in_open": float(locked_open or 0.0),
+                "available_to_deploy": trading_pool - float(locked_open or 0.0),
+            }
+        except Exception:
+            bot_pool = None
 
         return {
             "wallet": wallet,
@@ -847,6 +899,7 @@ def create_app(state: StateManager) -> FastAPI:
                 "to_win": total_to_win,
                 "count": len(positions),
             },
+            "bot_pool": bot_pool,
         }
 
     # ------------------------------------------------------------------
