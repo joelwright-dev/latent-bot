@@ -73,22 +73,21 @@ async def get_gain_balance(db: Optional[Database] = None) -> float:
 
 
 async def get_available_balance(db: Optional[Database] = None) -> float:
-    """Trading pool balance minus capital currently locked in bot-managed
-    open positions.
+    """Cash the bot can deploy to a new order.
 
-    Strategy 'M' (mirror) positions reflect manual trades made directly
-    on Polymarket — those used the user's own USDC, not the bot's
-    tracked pool, so they're excluded from the lock calculation.
+    Equal to the trading-pool ledger balance — `open_trade` already
+    deducts principal at position-open time, so `trading_balance` is
+    always net of capital tied up in currently-open positions. The
+    historical version of this function subtracted `SUM(size_usdc
+    WHERE status='open')` as well, which double-counted and drove
+    `available` negative when open-position count was high, blocking
+    every new trade despite real cash being available.
 
-    Used by risk.py to decide whether to fire a new trade.
+    Strategy 'M' (mirror) positions never hit the ledger anyway —
+    those are manual Polymarket trades reflected for display only.
     """
     db = db or get_db()
-    balance = await get_trading_balance(db)
-    locked = await db.fetchval(
-        "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions "
-        "WHERE status = 'open' AND strategy != 'M'"
-    )
-    return balance - float(locked or 0.0)
+    return await get_trading_balance(db)
 
 
 # ---------------------------------------------------------------------------

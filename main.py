@@ -143,6 +143,7 @@ async def main() -> None:
 
     app = create_app(state)
     app.state.git_commit = GIT_COMMIT
+    app.state.reconciler = reconciler
     log.info("running at commit %s", GIT_COMMIT)
 
     stop_event = asyncio.Event()

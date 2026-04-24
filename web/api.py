@@ -377,6 +377,56 @@ def create_app(state: StateManager) -> FastAPI:
         return {"ok": True, "gain_pool": new_gain, "trading_pool": new_trading}
 
     # ------------------------------------------------------------------
+    # POST /api/positions/reconcile
+    # ------------------------------------------------------------------
+    # On-demand trigger for the PositionReconciler's cycle. Useful when
+    # positions have obviously resolved on Polymarket but the bot's DB
+    # still marks them 'open' — forces an immediate sync rather than
+    # waiting for the next 3-minute tick.
+    @app.post("/api/positions/reconcile", dependencies=[Depends(require_auth)])
+    async def force_reconcile_positions() -> dict:
+        reconciler = getattr(app.state, "reconciler", None)
+        if reconciler is None:
+            raise HTTPException(500, detail="reconciler not initialised")
+        db = get_db()
+        before = await db.fetchone(
+            "SELECT "
+            "  SUM(CASE WHEN status='open' AND strategy != 'M' THEN 1 ELSE 0 END) AS n_open, "
+            "  SUM(CASE WHEN status='awaiting_redeem' THEN 1 ELSE 0 END) AS n_awaiting, "
+            "  SUM(CASE WHEN status='settled' THEN 1 ELSE 0 END) AS n_settled "
+            "FROM positions WHERE strategy IN ('A','B','C','D','M')"
+        )
+        try:
+            await reconciler._cycle()
+        except Exception as e:
+            raise HTTPException(502, detail=f"reconciler cycle failed: {e}") from e
+        after = await db.fetchone(
+            "SELECT "
+            "  SUM(CASE WHEN status='open' AND strategy != 'M' THEN 1 ELSE 0 END) AS n_open, "
+            "  SUM(CASE WHEN status='awaiting_redeem' THEN 1 ELSE 0 END) AS n_awaiting, "
+            "  SUM(CASE WHEN status='settled' THEN 1 ELSE 0 END) AS n_settled "
+            "FROM positions WHERE strategy IN ('A','B','C','D','M')"
+        )
+        await state.broadcast(Signal(
+            kind=SignalKind.DASHBOARD_REFRESH,
+            payload={"section": "positions"},
+            source="api",
+        ))
+        return {
+            "ok": True,
+            "before": {
+                "open": int(before["n_open"] or 0),
+                "awaiting_redeem": int(before["n_awaiting"] or 0),
+                "settled": int(before["n_settled"] or 0),
+            },
+            "after": {
+                "open": int(after["n_open"] or 0),
+                "awaiting_redeem": int(after["n_awaiting"] or 0),
+                "settled": int(after["n_settled"] or 0),
+            },
+        }
+
+    # ------------------------------------------------------------------
     # POST /api/capital/reconcile-to-onchain
     # ------------------------------------------------------------------
     # If (trading + gain) ledger cash exceeds what's actually in the

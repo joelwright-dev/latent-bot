@@ -201,7 +201,11 @@
 
       <div class="flex items-center gap-3">
         <div class="text-xs text-slate-500">Live view of polymarket.com portfolio. Refreshes every 30s.</div>
-        <button class="btn ml-auto" @click="loadPortfolio">refresh</button>
+        <button class="btn ml-auto" @click="forceReconcilePositions" :disabled="reconcilePosBusy"
+          title="Force a position-reconciler cycle — settles any bot positions that have actually resolved on Polymarket but are still marked open in the DB">
+          {{ reconcilePosBusy ? '…reconciling' : '⟳ reconcile positions' }}
+        </button>
+        <button class="btn" @click="loadPortfolio">refresh</button>
       </div>
 
       <div class="card p-0 overflow-x-auto">
@@ -1205,6 +1209,7 @@ createApp({
     const transferAmount = ref('');
     const diagBusy = ref(false);
     const reconcileBusy = ref(false);
+    const reconcilePosBusy = ref(false);
 
     // ---------- helpers ----------
     const fmt = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '0.00' : Number(v).toFixed(d);
@@ -1668,6 +1673,29 @@ createApp({
       } catch (e) { alert(e.message); }
     };
 
+    const forceReconcilePositions = async () => {
+      if (reconcilePosBusy.value) return;
+      reconcilePosBusy.value = true;
+      try {
+        const r = await postJson('/api/positions/reconcile', {});
+        const b = r.before, a = r.after;
+        const settledDelta = a.settled - b.settled;
+        const openDelta = a.open - b.open;
+        const awaitDelta = a.awaiting_redeem - b.awaiting_redeem;
+        alert(
+          `Reconcile done.\n` +
+          `  open:            ${b.open} → ${a.open} (${openDelta >= 0 ? '+' : ''}${openDelta})\n` +
+          `  awaiting_redeem: ${b.awaiting_redeem} → ${a.awaiting_redeem} (${awaitDelta >= 0 ? '+' : ''}${awaitDelta})\n` +
+          `  settled:         ${b.settled} → ${a.settled} (${settledDelta >= 0 ? '+' : ''}${settledDelta})`
+        );
+        await Promise.all([refreshAll(), loadPortfolio()]);
+      } catch (e) {
+        alert('Reconcile failed: ' + e.message);
+      } finally {
+        reconcilePosBusy.value = false;
+      }
+    };
+
     const reconcileLedger = async () => {
       if (reconcileBusy.value) return;
       if (!confirm(`Deduct $${(-ledgerDelta.value).toFixed(2)} from the bot ledger to match on-chain USDC.e? This writes an "adjustment" entry — it does NOT move any on-chain funds.`)) return;
@@ -1762,6 +1790,7 @@ createApp({
       dStats, loadStrategyDStats,
       forceRefreshDLeaders, rosterRefreshMsg,
       portfolio, loadPortfolio, ledgerDelta, reconcileLedger, reconcileBusy,
+      forceReconcilePositions, reconcilePosBusy,
       fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl,
       loadHistory, saveConfig, toggleStrategy, toggleBot, withdraw, transferGain,
       presetsLive, presetsBacktest, presetSelected, presetNewName, presetMsg,
