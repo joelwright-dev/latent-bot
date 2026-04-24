@@ -563,12 +563,17 @@ class StrategyD:
         # same "available" snapshot is prevented.
         async with self._pending_lock:
             pool = await get_trading_balance(self.state.db)
+            # trading_balance is already net of open-position principal —
+            # open_trade deducts at position-open time. We only need to
+            # subtract _pending_usdc here (orders queued in this cycle
+            # that haven't hit the ledger yet) to avoid racing concurrent
+            # copies. Fetch `locked` for the log line only.
             locked = await self.state.db.fetchval(
                 "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions "
                 "WHERE status = 'open' AND strategy != 'M'"
             )
             locked = float(locked or 0)
-            effective_available = pool - locked - self._pending_usdc
+            effective_available = pool - self._pending_usdc
 
             # Desired size, capped at max_position. If size-scaling by
             # leader bet size is enabled, add a multiplier: base size at
