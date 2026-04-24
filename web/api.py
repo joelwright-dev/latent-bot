@@ -377,6 +377,81 @@ def create_app(state: StateManager) -> FastAPI:
         return {"ok": True, "gain_pool": new_gain, "trading_pool": new_trading}
 
     # ------------------------------------------------------------------
+    # POST /api/capital/reconcile-to-onchain
+    # ------------------------------------------------------------------
+    # If (trading + gain) ledger cash exceeds what's actually in the
+    # wallet on-chain, deduct the difference from trading and record
+    # it as an adjustment. Never credits — on-chain > ledger just means
+    # the user added cash outside the bot, which is fine.
+    @app.post("/api/capital/reconcile-to-onchain",
+              dependencies=[Depends(require_auth)])
+    async def reconcile_to_onchain() -> dict:
+        cfg = get_config()
+        wallet = cfg.polymarket_proxy_address
+        if not wallet:
+            raise HTTPException(400, detail="POLYMARKET_PROXY_ADDRESS not set")
+        if not cfg.polygon_rpc_url:
+            raise HTTPException(400, detail="POLYGON_RPC_URL not set")
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as s:
+            on_chain = await _fetch_usdc_e_balance(s, wallet, cfg.polygon_rpc_url)
+        if on_chain is None:
+            raise HTTPException(502, detail="failed to read on-chain USDC.e")
+
+        trading = await pools.get_trading_balance()
+        gain = await pools.get_gain_balance()
+        drift = round((trading + gain) - on_chain, 6)
+        if drift <= 0.000_001:
+            return {
+                "ok": True, "adjusted": False,
+                "on_chain": on_chain, "trading": trading, "gain": gain,
+                "drift": drift,
+            }
+
+        # Prefer to debit trading (where the drift likely originated from
+        # over-seeding or settle-accounting slippage). If drift exceeds
+        # trading, take the remainder from gain.
+        from_trading = min(drift, trading)
+        from_gain = max(0.0, drift - from_trading)
+
+        db = get_db()
+        async with db.transaction() as conn:
+            if from_trading > 0:
+                new_trading = trading - from_trading
+                await conn.execute(
+                    "INSERT INTO pool_ledger(timestamp, event_type, amount, pool, "
+                    "balance_after, position_id, memo) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (int(time.time()), "adjustment", -from_trading, "trading",
+                     new_trading, None,
+                     f"reconcile to on-chain (drift ${drift:.2f})"),
+                )
+            if from_gain > 0:
+                new_gain = gain - from_gain
+                await conn.execute(
+                    "INSERT INTO pool_ledger(timestamp, event_type, amount, pool, "
+                    "balance_after, position_id, memo) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (int(time.time()), "adjustment", -from_gain, "gain",
+                     new_gain, None,
+                     f"reconcile to on-chain (drift ${drift:.2f})"),
+                )
+
+        new_trading_final = await pools.get_trading_balance()
+        new_gain_final = await pools.get_gain_balance()
+        await state.broadcast(Signal(
+            kind=SignalKind.DASHBOARD_REFRESH,
+            payload={"section": "pools"},
+            source="api",
+        ))
+        return {
+            "ok": True, "adjusted": True,
+            "on_chain": on_chain,
+            "trading": new_trading_final, "gain": new_gain_final,
+            "drift_deducted": drift,
+            "from_trading": from_trading, "from_gain": from_gain,
+        }
+
+    # ------------------------------------------------------------------
     # POST /api/strategy/toggle
     # ------------------------------------------------------------------
     @app.post("/api/strategy/toggle", dependencies=[Depends(require_auth)])
@@ -867,22 +942,27 @@ def create_app(state: StateManager) -> FastAPI:
         )
 
         # Internal bot pool — the ledger-tracked trading capital. Shown
-        # separately from the on-chain cash because the two aren't the
-        # same thing: on-chain USDC.e includes funds the user may have
-        # added manually that the bot doesn't size trades off.
+        # separately from on-chain cash: on-chain USDC.e may include
+        # funds the user added manually without running seed_deposit,
+        # which the bot doesn't know about (ledger delta will flag it).
+        # "Committed to open" is the sum of principal tied up in
+        # currently-open bot positions — informational only, NOT
+        # subtracted from trading_balance (the ledger deducts principal
+        # at open via open_trade / credits back at settle_trade).
         db = get_db()
         try:
             trading_pool = await pools.get_trading_balance(db)
             gain_pool = await pools.get_gain_balance(db)
-            locked_open = await db.fetchval(
-                "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions "
-                "WHERE status = 'open' AND strategy != 'M'"
+            committed_row = await db.fetchone(
+                "SELECT COALESCE(SUM(size_usdc), 0.0) AS amt, "
+                "       COUNT(*) AS n "
+                "FROM positions WHERE status = 'open' AND strategy != 'M'"
             )
             bot_pool = {
                 "trading_balance": trading_pool,
                 "gain_balance": gain_pool,
-                "locked_in_open": float(locked_open or 0.0),
-                "available_to_deploy": trading_pool - float(locked_open or 0.0),
+                "committed_to_open": float(committed_row["amt"] or 0.0),
+                "committed_count": int(committed_row["n"] or 0),
             }
         except Exception:
             bot_pool = None

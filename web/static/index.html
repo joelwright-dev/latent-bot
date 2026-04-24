@@ -160,17 +160,19 @@
         </div>
       </div>
 
-      <div class="text-xs text-slate-500 uppercase tracking-wider pt-2">Bot internal ledger</div>
+      <div class="flex items-center gap-3 pt-2">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Bot internal ledger</div>
+        <button v-if="ledgerDelta < -0.01" class="btn ml-auto"
+                @click="reconcileLedger" :disabled="reconcileBusy"
+                title="Write an adjustment entry to bring the ledger back in line with on-chain cash">
+          {{ reconcileBusy ? '…reconciling' : `⚠ reconcile ($${(-ledgerDelta).toFixed(2)})` }}
+        </button>
+      </div>
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
         <div class="card p-4">
           <div class="text-xs text-slate-500 uppercase tracking-wider">Trading pool (seeded)</div>
           <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.bot_pool?.trading_balance) }}</div>
-          <div class="text-xs text-slate-500 mt-1">bot sizes orders off this</div>
-        </div>
-        <div class="card p-4">
-          <div class="text-xs text-slate-500 uppercase tracking-wider">Available to deploy</div>
-          <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.bot_pool?.available_to_deploy) }}</div>
-          <div class="text-xs text-slate-500 mt-1 num">${{ fmt(portfolio.bot_pool?.locked_in_open) }} locked in open</div>
+          <div class="text-xs text-slate-500 mt-1">what the bot sizes new orders off</div>
         </div>
         <div class="card p-4">
           <div class="text-xs text-slate-500 uppercase tracking-wider">Gain pool</div>
@@ -178,12 +180,22 @@
           <div class="text-xs text-slate-500 mt-1">withdrawable profit share</div>
         </div>
         <div class="card p-4">
-          <div class="text-xs text-slate-500 uppercase tracking-wider">Ledger vs on-chain delta</div>
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Committed to open positions</div>
+          <div class="text-2xl font-semibold num mt-1">${{ fmt(portfolio.bot_pool?.committed_to_open) }}</div>
+          <div class="text-xs text-slate-500 mt-1">
+            {{ portfolio.bot_pool?.committed_count || 0 }} open
+            — principal already deducted from trading pool
+          </div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">On-chain − ledger</div>
           <div class="text-2xl font-semibold num mt-1"
-               :class="ledgerDelta >= 0 ? 'text-slate-300' : 'text-amber-400'">
+               :class="ledgerDelta >= 0 ? 'text-slate-300' : 'text-rose-400'">
             {{ ledgerDelta >= 0 ? '+' : '' }}${{ fmt(ledgerDelta) }}
           </div>
-          <div class="text-xs text-slate-500 mt-1">on-chain minus bot-tracked</div>
+          <div class="text-xs text-slate-500 mt-1">
+            positive = extra wallet cash; negative = ledger over-reports (click reconcile)
+          </div>
         </div>
       </div>
 
@@ -1192,6 +1204,7 @@ createApp({
     const withdrawAmount = ref('');
     const transferAmount = ref('');
     const diagBusy = ref(false);
+    const reconcileBusy = ref(false);
 
     // ---------- helpers ----------
     const fmt = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '0.00' : Number(v).toFixed(d);
@@ -1655,6 +1668,25 @@ createApp({
       } catch (e) { alert(e.message); }
     };
 
+    const reconcileLedger = async () => {
+      if (reconcileBusy.value) return;
+      if (!confirm(`Deduct $${(-ledgerDelta.value).toFixed(2)} from the bot ledger to match on-chain USDC.e? This writes an "adjustment" entry — it does NOT move any on-chain funds.`)) return;
+      reconcileBusy.value = true;
+      try {
+        const r = await postJson('/api/capital/reconcile-to-onchain', {});
+        if (r.adjusted) {
+          alert(`Reconciled. Deducted $${r.drift_deducted.toFixed(2)} (trading: -$${r.from_trading.toFixed(2)}, gain: -$${r.from_gain.toFixed(2)}).`);
+        } else {
+          alert('No adjustment needed — ledger already at or below on-chain.');
+        }
+        await Promise.all([refreshAll(), loadPortfolio()]);
+      } catch (e) {
+        alert('Reconcile failed: ' + e.message);
+      } finally {
+        reconcileBusy.value = false;
+      }
+    };
+
     const exportDiagnostics = async () => {
       if (diagBusy.value) return;
       diagBusy.value = true;
@@ -1729,7 +1761,7 @@ createApp({
       leaders, leadersMeta, loadLeaders, fmtAgeDelta,
       dStats, loadStrategyDStats,
       forceRefreshDLeaders, rosterRefreshMsg,
-      portfolio, loadPortfolio, ledgerDelta,
+      portfolio, loadPortfolio, ledgerDelta, reconcileLedger, reconcileBusy,
       fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl,
       loadHistory, saveConfig, toggleStrategy, toggleBot, withdraw, transferGain,
       presetsLive, presetsBacktest, presetSelected, presetNewName, presetMsg,
