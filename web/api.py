@@ -1071,6 +1071,246 @@ def create_app(state: StateManager) -> FastAPI:
         }
 
     # ------------------------------------------------------------------
+    # GET /api/diagnostics/export
+    # ------------------------------------------------------------------
+    # Produces a single JSON payload containing everything useful for
+    # strategy tuning: per-exit-reason P&L, per-leader performance,
+    # per-category breakdowns, hold-time distributions, and the most
+    # recent 100 settled positions. Downloaded as a file by the
+    # "Export diagnostics" button on the dashboard.
+    @app.get("/api/diagnostics/export")
+    async def diagnostics_export() -> dict:
+        db = get_db()
+        cfg = get_config()
+        now = int(time.time())
+
+        sensitive = {"private_key", "polygon_rpc_url", "dashboard_secret"}
+        config_dump = {
+            k: v for k, v in asdict(cfg).items() if k not in sensitive
+        }
+
+        schema_version = await db.fetchval(
+            "SELECT MAX(version) FROM schema_version"
+        )
+
+        trading_bal = await pools.get_trading_balance()
+        gain_bal = await pools.get_gain_balance()
+        locked_open = await db.fetchval(
+            "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions "
+            "WHERE status = 'open' AND strategy != 'M'"
+        )
+
+        ledger_rows = await db.fetchall(
+            "SELECT timestamp, pool, event_type, amount, balance_after, "
+            "       position_id, memo FROM pool_ledger "
+            "ORDER BY id DESC LIMIT 50"
+        )
+
+        by_status = await db.fetchall(
+            "SELECT strategy, status, COUNT(*) AS n, "
+            "       ROUND(COALESCE(SUM(gain_usdc), 0), 2) AS total_gain "
+            "FROM positions GROUP BY strategy, status"
+        )
+
+        d_headline = await db.fetchone(
+            "SELECT COUNT(*) AS n, "
+            "       ROUND(COALESCE(SUM(gain_usdc), 0), 2) AS total_pnl, "
+            "       ROUND(COALESCE(AVG(gain_usdc), 0), 3) AS avg_pnl, "
+            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(COALESCE(AVG(CASE WHEN gain_usdc > 0 THEN gain_usdc END), 0), 3) AS avg_win, "
+            "       ROUND(COALESCE(AVG(CASE WHEN gain_usdc <= 0 THEN gain_usdc END), 0), 3) AS avg_loss, "
+            "       ROUND(COALESCE(MAX(gain_usdc), 0), 2) AS best, "
+            "       ROUND(COALESCE(MIN(gain_usdc), 0), 2) AS worst, "
+            "       ROUND(COALESCE(SUM(size_usdc), 0), 2) AS principal_deployed "
+            "FROM positions WHERE strategy = 'D' AND status = 'settled'"
+        )
+        d_open = await db.fetchone(
+            "SELECT COUNT(*) AS n, "
+            "       ROUND(COALESCE(SUM(size_usdc), 0), 2) AS principal_open "
+            "FROM positions WHERE strategy = 'D' AND status = 'open'"
+        )
+
+        by_exit = await db.fetchall(
+            "SELECT COALESCE(exit_reason, 'auto_redeem') AS reason, COUNT(*) AS n, "
+            "       ROUND(COALESCE(SUM(gain_usdc), 0), 2) AS total_pnl, "
+            "       ROUND(COALESCE(AVG(gain_usdc), 0), 3) AS avg_pnl, "
+            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(COALESCE(MIN(gain_usdc), 0), 2) AS worst, "
+            "       ROUND(COALESCE(MAX(gain_usdc), 0), 2) AS best, "
+            "       ROUND(COALESCE(AVG(entry_price), 0), 4) AS avg_entry, "
+            "       ROUND(COALESCE(AVG(peak_price/NULLIF(entry_price,0)), 0), 2) AS avg_peak_mult "
+            "FROM positions WHERE strategy = 'D' AND status = 'settled' "
+            "GROUP BY reason ORDER BY total_pnl"
+        )
+
+        by_leader = await db.fetchall(
+            "SELECT COALESCE(leader_wallet, 'unknown') AS wallet, COUNT(*) AS n, "
+            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(COALESCE(SUM(gain_usdc), 0), 2) AS total_pnl, "
+            "       ROUND(COALESCE(AVG(gain_usdc), 0), 3) AS avg_pnl, "
+            "       ROUND(COALESCE(AVG(entry_price), 0), 4) AS avg_entry "
+            "FROM positions WHERE strategy = 'D' AND status = 'settled' "
+            "GROUP BY leader_wallet ORDER BY total_pnl"
+        )
+
+        by_entry = await db.fetchall(
+            "SELECT CASE "
+            "         WHEN entry_price < 0.05 THEN 'A: 0.00-0.05' "
+            "         WHEN entry_price < 0.15 THEN 'B: 0.05-0.15' "
+            "         WHEN entry_price < 0.30 THEN 'C: 0.15-0.30' "
+            "         WHEN entry_price < 0.50 THEN 'D: 0.30-0.50' "
+            "         WHEN entry_price < 0.70 THEN 'E: 0.50-0.70' "
+            "         WHEN entry_price < 0.90 THEN 'F: 0.70-0.90' "
+            "         ELSE 'G: 0.90+' END AS bucket, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(COALESCE(SUM(gain_usdc), 0), 2) AS total_pnl, "
+            "       ROUND(COALESCE(AVG(gain_usdc), 0), 3) AS avg_pnl "
+            "FROM positions WHERE strategy = 'D' AND status = 'settled' "
+            "GROUP BY bucket ORDER BY bucket"
+        )
+
+        by_category = await db.fetchall(
+            "SELECT LOWER(COALESCE(m.category, 'uncategorized')) AS category, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN p.gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(COALESCE(SUM(p.gain_usdc), 0), 2) AS total_pnl, "
+            "       ROUND(COALESCE(AVG(p.gain_usdc), 0), 3) AS avg_pnl "
+            "FROM positions p LEFT JOIN markets m ON m.token_id = p.market_token_id "
+            "WHERE p.strategy = 'D' AND p.status = 'settled' "
+            "GROUP BY category ORDER BY total_pnl"
+        )
+
+        by_hour = await db.fetchall(
+            "SELECT CAST(strftime('%H', opened_at, 'unixepoch') AS INT) AS hour_utc, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(COALESCE(SUM(gain_usdc), 0), 2) AS total_pnl "
+            "FROM positions WHERE strategy = 'D' AND status = 'settled' "
+            "GROUP BY hour_utc ORDER BY hour_utc"
+        )
+
+        by_hold = await db.fetchall(
+            "SELECT CASE "
+            "         WHEN (settled_at - opened_at) < 300 THEN 'A: <5m' "
+            "         WHEN (settled_at - opened_at) < 1800 THEN 'B: 5-30m' "
+            "         WHEN (settled_at - opened_at) < 7200 THEN 'C: 30m-2h' "
+            "         WHEN (settled_at - opened_at) < 21600 THEN 'D: 2h-6h' "
+            "         WHEN (settled_at - opened_at) < 86400 THEN 'E: 6h-24h' "
+            "         ELSE 'F: 24h+' END AS bucket, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(COALESCE(SUM(gain_usdc), 0), 2) AS total_pnl, "
+            "       ROUND(COALESCE(AVG(gain_usdc), 0), 3) AS avg_pnl "
+            "FROM positions WHERE strategy = 'D' AND status = 'settled' "
+            "  AND settled_at IS NOT NULL "
+            "GROUP BY bucket ORDER BY bucket"
+        )
+
+        leader_cat = await db.fetchall(
+            "SELECT p.leader_wallet AS wallet, "
+            "       LOWER(COALESCE(m.category, 'uncategorized')) AS category, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN p.gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
+            "       ROUND(COALESCE(SUM(p.gain_usdc), 0), 2) AS total_pnl "
+            "FROM positions p LEFT JOIN markets m ON m.token_id = p.market_token_id "
+            "WHERE p.strategy = 'D' AND p.status = 'settled' "
+            "  AND p.leader_wallet IS NOT NULL "
+            "GROUP BY p.leader_wallet, category ORDER BY total_pnl"
+        )
+
+        last_100 = await db.fetchall(
+            "SELECT p.id, p.leader_wallet AS wallet, "
+            "       LOWER(COALESCE(m.category, 'uncategorized')) AS category, "
+            "       p.entry_price, p.peak_price, p.size_usdc, p.shares, "
+            "       p.status, p.gain_usdc, p.exit_reason, "
+            "       p.opened_at, p.settled_at, "
+            "       (p.settled_at - p.opened_at) AS hold_secs, "
+            "       m.question, m.resolution_timestamp "
+            "FROM positions p LEFT JOIN markets m ON m.token_id = p.market_token_id "
+            "WHERE p.strategy = 'D' "
+            "ORDER BY p.id DESC LIMIT 100"
+        )
+
+        events_counts = await db.fetchall(
+            "SELECT level, source, COUNT(*) AS n FROM bot_events "
+            "WHERE timestamp >= ? GROUP BY level, source ORDER BY n DESC",
+            (now - 24 * 3600,),
+        )
+        recent_errors = await db.fetchall(
+            "SELECT timestamp, source, message FROM bot_events "
+            "WHERE level = 'error' ORDER BY id DESC LIMIT 30"
+        )
+        recent_warnings = await db.fetchall(
+            "SELECT timestamp, source, message FROM bot_events "
+            "WHERE level = 'warn' ORDER BY id DESC LIMIT 30"
+        )
+
+        total_markets = await db.fetchval("SELECT COUNT(*) FROM markets")
+        resolved_markets = await db.fetchval(
+            "SELECT COUNT(*) FROM markets WHERE status = 'resolved' "
+            "  OR resolved_outcome IS NOT NULL"
+        )
+
+        roster_snapshot = [
+            {k: v for k, v in dict(l).items() if k not in ("raw",)}
+            for l in (state.d_leaders or [])
+        ] if isinstance(state.d_leaders, list) else list(state.d_leaders or [])
+
+        return {
+            "meta": {
+                "generated_at": now,
+                "schema_version": schema_version,
+                "bot_uptime_secs": int(now - state.started_at),
+                "last_heartbeat_secs_ago": int(now - state.last_heartbeat),
+                "paused_reason": state.paused_reason,
+            },
+            "config": config_dump,
+            "pools": {
+                "trading_balance": trading_bal,
+                "gain_balance": gain_bal,
+                "locked_in_open_positions": float(locked_open or 0.0),
+                "available_to_deploy": trading_bal - float(locked_open or 0.0),
+                "recent_ledger": [dict(r) for r in ledger_rows],
+            },
+            "positions_summary": {
+                "by_strategy_status": [dict(r) for r in by_status],
+            },
+            "strategy_d": {
+                "settled": dict(d_headline) if d_headline else {},
+                "open": dict(d_open) if d_open else {},
+                "win_rate": (
+                    (int(d_headline["wins"] or 0) / int(d_headline["n"]))
+                    if d_headline and int(d_headline["n"] or 0) > 0 else 0.0
+                ),
+                "by_exit_reason": [dict(r) for r in by_exit],
+                "by_leader": [dict(r) for r in by_leader],
+                "by_entry_price_bucket": [dict(r) for r in by_entry],
+                "by_category": [dict(r) for r in by_category],
+                "by_hour_utc": [dict(r) for r in by_hour],
+                "by_hold_time": [dict(r) for r in by_hold],
+                "leader_x_category": [dict(r) for r in leader_cat],
+                "last_100_positions": [dict(r) for r in last_100],
+            },
+            "current_leader_roster": {
+                "leaders": roster_snapshot,
+                "refreshed_at": state.d_leaders_refreshed_at,
+            },
+            "events": {
+                "counts_24h": [dict(r) for r in events_counts],
+                "recent_errors": [dict(r) for r in recent_errors],
+                "recent_warnings": [dict(r) for r in recent_warnings],
+            },
+            "market_resolution_coverage": {
+                "total_markets": int(total_markets or 0),
+                "resolved": int(resolved_markets or 0),
+                "coverage_pct": round(
+                    (int(resolved_markets or 0) / int(total_markets)) * 100.0, 2
+                ) if int(total_markets or 0) > 0 else 0.0,
+            },
+        }
+
+    # ------------------------------------------------------------------
     # GET /api/graph — dependency graph (nodes + edges) for visualisation
     # ------------------------------------------------------------------
     @app.get("/api/graph")

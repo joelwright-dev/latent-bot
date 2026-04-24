@@ -56,6 +56,11 @@
       </button>
       <span class="text-xs text-slate-500">uptime {{ fmtUptime(status.uptime_secs) }}</span>
       <span v-if="status.paused_reason" class="text-xs text-rose-400">paused: {{ status.paused_reason }}</span>
+      <button @click="exportDiagnostics" :disabled="diagBusy"
+        class="pill border border-slate-700 bg-slate-800 hover:bg-slate-700 text-xs px-3 py-1"
+        title="Download a JSON snapshot of everything useful for strategy tuning">
+        {{ diagBusy ? '…exporting' : '📥 export diagnostics' }}
+      </button>
     </div>
     <div class="flex items-center gap-2 flex-1 sm:flex-none justify-end min-w-0">
       <label class="text-xs text-slate-500">secret</label>
@@ -1141,6 +1146,7 @@ createApp({
     const portfolio = reactive({ positions: [], totals: {} });
     const withdrawAmount = ref('');
     const transferAmount = ref('');
+    const diagBusy = ref(false);
 
     // ---------- helpers ----------
     const fmt = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '0.00' : Number(v).toFixed(d);
@@ -1603,6 +1609,29 @@ createApp({
       } catch (e) { alert(e.message); }
     };
 
+    const exportDiagnostics = async () => {
+      if (diagBusy.value) return;
+      diagBusy.value = true;
+      try {
+        const r = await fetch('/api/diagnostics/export');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const blob = await r.blob();
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `latent-bot-diagnostics-${ts}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        alert('Export failed: ' + e.message);
+      } finally {
+        diagBusy.value = false;
+      }
+    };
+
     // ---------- websocket ----------
     const connectWs = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -1647,6 +1676,7 @@ createApp({
     return {
       tab, tabs, secret, saveSecret, status, pools, stats, config, draft, ledger,
       events, openPositions, history, historyFilter, withdrawAmount, transferAmount,
+      diagBusy, exportDiagnostics,
       upcoming, upcomingFilter, loadUpcoming, setPreset,
       wouldBuy, whyNot, matchCount, gainMultClass,
       graphEl, graphFilter, graphMeta, loadGraph,
