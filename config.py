@@ -83,6 +83,7 @@ class Config:
     strategy_d_min_entry_price: float     # skip buys below this price (avoid cheap longshots with 0% win rate)
     strategy_d_leader_min_trades: int     # min settled copies before judging a leader
     strategy_d_leader_min_win_rate: float # blocklist leaders with win% below this after min_trades
+    strategy_d_leader_blocklist: str      # comma-separated wallet addresses to hard-block (any case)
     # --- Leader selection ---
     strategy_d_leaderboard_window: str    # "7d" / "30d" / "90d" — longer = less noise
     strategy_d_min_leader_history: int    # min historical trades before we'll follow a leader
@@ -110,6 +111,7 @@ class Config:
     # positions that haven't had time to find their level yet.
     monitor_confirm_polls: int            # e.g. 3 = require 3 polls below trail before exit
     monitor_max_loss_confirm_polls: int   # e.g. 2 = require 2 polls below max-loss line (filter single-tick wicks)
+    monitor_trailing_activation_gain: float  # peak must be ≥ this × entry before trailing arms (higher = protect only real gains)
     monitor_min_hold_secs: int            # e.g. 300 = skip first 5 min after entry
     # Trader-exit signal: if a copied leader sells their side, we exit too.
     monitor_trader_exit_enabled: bool
@@ -215,9 +217,10 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_num_leaders=_i(values.get("STRATEGY_D_NUM_LEADERS"), 5),
         strategy_d_max_leader_idle_hours=_i(values.get("STRATEGY_D_MAX_LEADER_IDLE_HOURS"), 24),
         strategy_d_max_entry_price=_f(values.get("STRATEGY_D_MAX_ENTRY_PRICE"), 0.95),
-        strategy_d_min_entry_price=_f(values.get("STRATEGY_D_MIN_ENTRY_PRICE"), 0.0),
-        strategy_d_leader_min_trades=_i(values.get("STRATEGY_D_LEADER_MIN_TRADES"), 10),
-        strategy_d_leader_min_win_rate=_f(values.get("STRATEGY_D_LEADER_MIN_WIN_RATE"), 0.30),
+        strategy_d_min_entry_price=_f(values.get("STRATEGY_D_MIN_ENTRY_PRICE"), 0.15),
+        strategy_d_leader_min_trades=_i(values.get("STRATEGY_D_LEADER_MIN_TRADES"), 5),
+        strategy_d_leader_min_win_rate=_f(values.get("STRATEGY_D_LEADER_MIN_WIN_RATE"), 0.45),
+        strategy_d_leader_blocklist=_s(values.get("STRATEGY_D_LEADER_BLOCKLIST"), ""),
         strategy_d_leaderboard_window=_s(values.get("STRATEGY_D_LEADERBOARD_WINDOW"), "30d"),
         strategy_d_min_leader_history=_i(values.get("STRATEGY_D_MIN_LEADER_HISTORY"), 100),
         strategy_d_consensus_leaders=_i(values.get("STRATEGY_D_CONSENSUS_LEADERS"), 1),
@@ -230,12 +233,13 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_inverse_copy=_b(values.get("STRATEGY_D_INVERSE_COPY"), False),
         monitor_enabled=_b(values.get("MONITOR_ENABLED"), True),
         monitor_poll_secs=_i(values.get("MONITOR_POLL_SECS"), 30),
-        monitor_max_loss_pct=_f(values.get("MONITOR_MAX_LOSS_PCT"), 0.50),
+        monitor_max_loss_pct=_f(values.get("MONITOR_MAX_LOSS_PCT"), 0.60),
         monitor_timeout_hours=_i(values.get("MONITOR_TIMEOUT_HOURS"), 48),
         monitor_timeout_min_multiple=_f(values.get("MONITOR_TIMEOUT_MIN_MULTIPLE"), 2.0),
         monitor_pre_resolution_hours=_f(values.get("MONITOR_PRE_RESOLUTION_HOURS"), 1.0),
         monitor_confirm_polls=_i(values.get("MONITOR_CONFIRM_POLLS"), 3),
-        monitor_max_loss_confirm_polls=_i(values.get("MONITOR_MAX_LOSS_CONFIRM_POLLS"), 2),
+        monitor_max_loss_confirm_polls=_i(values.get("MONITOR_MAX_LOSS_CONFIRM_POLLS"), 5),
+        monitor_trailing_activation_gain=_f(values.get("MONITOR_TRAILING_ACTIVATION_GAIN"), 2.5),
         monitor_min_hold_secs=_i(values.get("MONITOR_MIN_HOLD_SECS"), 300),
         monitor_trader_exit_enabled=_b(values.get("MONITOR_TRADER_EXIT_ENABLED"), True),
         monitor_trader_exit_window_min=_i(values.get("MONITOR_TRADER_EXIT_WINDOW_MIN"), 15),

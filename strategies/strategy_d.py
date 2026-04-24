@@ -752,12 +752,20 @@ class StrategyD:
         return sibling_token, ask
 
     async def _leader_blocked(self, wallet: str, cfg) -> bool:
-        """Return True if this leader's recent copy P&L disqualifies them.
+        """Return True if this leader is disqualified from being copied.
 
-        Judged on OUR settled positions, not the weekly leaderboard. A
-        leader with fewer than `leader_min_trades` settled copies gets
-        the benefit of the doubt (returns False). Once the sample is
-        large enough, we block if win rate falls below `leader_min_win_rate`.
+        Two gates, in order:
+
+        1. Hard blocklist (STRATEGY_D_LEADER_BLOCKLIST) — operator-set
+           wallets that are always blocked regardless of stats. Matches
+           case-insensitively.
+        2. Copy-P&L gate — once we have `leader_min_trades` settled
+           copies from this leader, block if their win rate falls below
+           `leader_min_win_rate`. Judged on OUR positions, not the
+           weekly leaderboard: a leader can be up $50k personally but
+           still be a bad copy target if their edge is in timing/markets
+           we can't replicate.
+
         Results cached for `_leader_eval_ttl` to avoid per-tick DB load.
         """
         now = time.time()
@@ -765,25 +773,29 @@ class StrategyD:
         if cached and (now - cached[1]) < self._leader_eval_ttl:
             return cached[0]
 
+        wallet_lc = wallet.lower() if wallet else ""
+        raw_list = cfg.strategy_d_leader_blocklist or ""
+        blocklist = {
+            w.strip().lower() for w in raw_list.split(",") if w.strip()
+        }
+        if wallet_lc in blocklist:
+            self._leader_verdict[wallet] = (True, now)
+            return True
+
         row = await self.state.db.fetchone(
             "SELECT COUNT(*) AS n, "
-            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins, "
-            "       COALESCE(SUM(gain_usdc), 0) AS total_gain "
+            "       SUM(CASE WHEN gain_usdc > 0 THEN 1 ELSE 0 END) AS wins "
             "FROM positions "
             "WHERE leader_wallet = ? AND strategy = 'D' AND status = 'settled'",
             (wallet,),
         )
         n = int(row["n"] or 0) if row else 0
         wins = int(row["wins"] or 0) if row else 0
-        total_gain = float(row["total_gain"] or 0) if row else 0.0
 
         blocked = False
         if n >= cfg.strategy_d_leader_min_trades:
             win_rate = wins / n if n > 0 else 0.0
-            # Block if win rate too low AND we're losing money on them.
-            # The "AND losing" clause prevents blocking leaders with 28%
-            # win rate but big winners that net positive.
-            if win_rate < cfg.strategy_d_leader_min_win_rate and total_gain < 0:
+            if win_rate < cfg.strategy_d_leader_min_win_rate:
                 blocked = True
 
         self._leader_verdict[wallet] = (blocked, now)

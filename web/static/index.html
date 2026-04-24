@@ -1006,6 +1006,9 @@
           <label class="block text-sm">Leader min win rate
             <input class="input w-full mt-1" type="number" step="0.01" v-model.number="draft.strategy_d_leader_min_win_rate" />
           </label>
+          <label class="block text-sm">Leader blocklist (comma-separated wallets)
+            <input class="input w-full mt-1" type="text" v-model="draft.strategy_d_leader_blocklist" placeholder="0xabc..,0xdef.." />
+          </label>
           <label class="flex items-center gap-2 text-sm">
             <input type="checkbox" v-model="draft.strategy_d_category_filter_enabled" /> Category filter
           </label>
@@ -1046,6 +1049,9 @@
           </label>
           <label class="block text-sm">Max-loss confirm polls (dwell)
             <input class="input w-full mt-1" type="number" v-model.number="draft.monitor_max_loss_confirm_polls" />
+          </label>
+          <label class="block text-sm">Trailing activation gain (×)
+            <input class="input w-full mt-1" type="number" step="0.1" v-model.number="draft.monitor_trailing_activation_gain" />
           </label>
           <label class="block text-sm">Min hold (secs)
             <input class="input w-full mt-1" type="number" v-model.number="draft.monitor_min_hold_secs" />

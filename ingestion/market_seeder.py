@@ -294,15 +294,30 @@ async def seed_once(state: StateManager) -> SeedStats:
             events_fetched += len(events)
             parsed = []
             for ev in events:
+                # Events carry the tag/category that /markets doesn't
+                # expose. Use the first tag's slug as our category so the
+                # per-category P&L breakdown and category filter work.
+                tag_slug: Optional[str] = None
+                for t in ev.get("tags") or []:
+                    if isinstance(t, dict):
+                        tag_slug = t.get("slug") or t.get("label")
+                        if tag_slug:
+                            tag_slug = str(tag_slug).strip().lower() or None
+                            break
                 for m_raw in ev.get("markets") or []:
                     m = _extract_market(m_raw)
                     if m is None:
                         stats.skipped += 1
                         continue
-                    # Cheap short-circuit: skip if we've already processed
-                    # this token in pass 1 with fresher data.
-                    if any(r["token_id"] in seen_tokens for r in m):
-                        continue
+                    # Enrich with the event's tag. Pass 1 upserts markets
+                    # without category (gamma /markets doesn't carry it),
+                    # and the upsert's ON CONFLICT writes excluded.category
+                    # — so even markets already seen in pass 1 benefit from
+                    # a pass-2 re-upsert. Don't short-circuit on seen_tokens.
+                    if tag_slug:
+                        for r in m:
+                            if not r.get("category"):
+                                r["category"] = tag_slug
                     for r in m:
                         seen_tokens.add(r["token_id"])
                     parsed.append(m)
