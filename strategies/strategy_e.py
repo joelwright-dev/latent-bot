@@ -459,6 +459,23 @@ class StrategyE:
             )
             return False
         hours_to_resolve = (end_ts - now) / 3600.0
+        # Optional floor: skip ultra-short markets where we'd lose the
+        # latency race (whale fills final 60s, book closes ~30s after
+        # endDate, we poll every 15-30s — physically too tight). Default
+        # 0 = no floor; set 0.25 to skip <15min markets.
+        if (
+            cfg.strategy_e_min_hours_to_resolve > 0
+            and 0 <= hours_to_resolve < cfg.strategy_e_min_hours_to_resolve
+        ):
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (resolves in {hours_to_resolve*60:.0f}m < floor "
+                f"{cfg.strategy_e_min_hours_to_resolve*60:.0f}m, latency race) "
+                f"from {whale.pseudonym}: {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "hours_to_resolve": hours_to_resolve},
+            )
+            return False
         if hours_to_resolve > cfg.strategy_e_max_hours_to_resolve:
             await self.state.db.log_event(
                 "info", "strategy_e",
@@ -491,11 +508,21 @@ class StrategyE:
         # --- Live ask check ---
         current_ask = await self._live_best_ask(token_id)
         if current_ask is None:
+            # Empty book usually means the market closed for orders.
+            # Surface the timing so the user can tell "we lost the race"
+            # (resolved minutes ago, no time to react) vs "market is
+            # genuinely illiquid right now".
+            timing = (
+                f"resolved {-hours_to_resolve*60:.0f}m ago"
+                if hours_to_resolve < 0
+                else f"{hours_to_resolve*60:.0f}m to resolve"
+            )
             await self.state.db.log_event(
                 "info", "strategy_e",
-                f"skip (no live ask) from {whale.pseudonym}: "
-                f"{title[:60]} [{outcome}]",
-                {"whale": whale.wallet, "token_id": token_id},
+                f"skip (no live ask, {timing} — market likely closed for "
+                f"orders) from {whale.pseudonym}: {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "hours_to_resolve": hours_to_resolve},
             )
             return False
 
