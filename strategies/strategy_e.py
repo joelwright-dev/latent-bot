@@ -469,13 +469,19 @@ class StrategyE:
                  "hours_to_resolve": hours_to_resolve},
             )
             return False
-        if hours_to_resolve < 0:
-            # Resolution timestamp passed but the market still trades —
-            # extension or stale endDate. Skip rather than buy something
-            # whose true resolve time we can't pin down.
+        # Polymarket's endDate is the event time, not the resolution
+        # time. Auto-resolution typically lags by a few minutes for
+        # ultra-short markets (5-min crypto candles) — and the whale
+        # trading at 0.99 IN that lag window is the cleanest clear-win
+        # signal we ever get. So we allow trades up to
+        # STRATEGY_E_MAX_HOURS_PAST_RESOLVE past nominal endDate.
+        # Beyond that, we treat the market as stale (extension, bug,
+        # cancelled) and skip.
+        if hours_to_resolve < -cfg.strategy_e_max_hours_past_resolve:
             await self.state.db.log_event(
                 "info", "strategy_e",
-                f"skip (resolution_ts in the past, market still trading) "
+                f"skip (resolved {-hours_to_resolve:.1f}h ago, "
+                f"past stale-cap {cfg.strategy_e_max_hours_past_resolve:.1f}h) "
                 f"from {whale.pseudonym}: {title[:60]} [{outcome}]",
                 {"whale": whale.wallet, "token_id": token_id,
                  "hours_to_resolve": hours_to_resolve},
@@ -557,11 +563,17 @@ class StrategyE:
         )
         lag_secs = int(time.time()) - trade_ts
         fills_str = f", {fills} fills" if fills > 1 else ""
+        # endDate may be slightly in the past for ultra-short markets;
+        # phrase the log line accordingly so it doesn't read as nonsense.
+        when_str = (
+            f"resolves in {hours_to_resolve:.1f}h" if hours_to_resolve >= 0
+            else f"awaiting resolution ({-hours_to_resolve*60:.0f}m past endDate)"
+        )
         await self.state.db.log_event(
             "info", "strategy_e",
             f"SNIPE {whale.pseudonym}: BUY ${size:.2f}@{current_ask:.4f} "
             f"({outcome}, whale@{their_price:.3f} bet ${their_bet:.0f}{fills_str}, "
-            f"resolves in {hours_to_resolve:.1f}h, {lag_secs}s lag): {title[:60]}",
+            f"{when_str}, {lag_secs}s lag): {title[:60]}",
             {"whale_wallet": whale.wallet, "whale_pseudonym": whale.pseudonym,
              "token_id": token_id, "their_price": their_price,
              "their_bet_usdc": their_bet, "fills": fills,

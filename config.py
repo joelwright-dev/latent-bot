@@ -110,6 +110,7 @@ class Config:
     strategy_e_copy_window_secs: int            # only copy whale trades within N sec of now
     strategy_e_min_entry_price: float           # skip buys below this (whole edge is "decided")
     strategy_e_max_hours_to_resolve: float      # skip markets with endDate further out than this
+    strategy_e_max_hours_past_resolve: float    # allow markets up to N hours past endDate (Polymarket auto-resolution lags)
     strategy_e_max_position: float              # absolute USD cap per snipe
     strategy_e_deploy_rate: float               # fraction of pool per snipe (small = more diversification)
     strategy_e_min_whale_bet_usdc: float        # only follow whale trades >= this size (0 = disable)
@@ -264,6 +265,7 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_e_copy_window_secs=_i(values.get("STRATEGY_E_COPY_WINDOW_SECS"), 600),
         strategy_e_min_entry_price=_f(values.get("STRATEGY_E_MIN_ENTRY_PRICE"), 0.85),
         strategy_e_max_hours_to_resolve=_f(values.get("STRATEGY_E_MAX_HOURS_TO_RESOLVE"), 24.0),
+        strategy_e_max_hours_past_resolve=_f(values.get("STRATEGY_E_MAX_HOURS_PAST_RESOLVE"), 2.0),
         strategy_e_max_position=_f(values.get("STRATEGY_E_MAX_POSITION"), 5.0),
         strategy_e_deploy_rate=_f(values.get("STRATEGY_E_DEPLOY_RATE"), 0.10),
         strategy_e_min_whale_bet_usdc=_f(values.get("STRATEGY_E_MIN_WHALE_BET_USDC"), 0.0),
