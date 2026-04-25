@@ -1248,7 +1248,8 @@
               <option value="all">all-time</option>
             </select>
           </label>
-          <label class="block text-sm"># whales to scan
+          <label class="block text-sm" title="How many top traders to pull from the leaderboard each refresh. Set 0 to disable the leaderboard entirely and follow ONLY the allowlist below.">
+            # whales to scan (0 = allowlist only)
             <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_e_num_whales" />
           </label>
           <label class="block text-sm" title="Whole edge is 'decided'. Lower = more candidates but more flip risk. Article suggests 0.95+; we default to 0.85 to follow whales who buy a hair earlier.">Min entry price

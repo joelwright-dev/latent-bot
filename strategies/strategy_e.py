@@ -259,29 +259,40 @@ class StrategyE:
                 window="allowlist",
             ))
 
-        raw = await self._fetch_top_traders(
-            cfg.strategy_e_num_whales,
-            window=cfg.strategy_e_leaderboard_window,
-        )
-        for w in raw:
-            wlc = w.wallet.lower()
-            if wlc in seen:
-                continue
-            seen.add(wlc)
-            whales.append(w)
-            if len(whales) >= cfg.strategy_e_num_whales + len(allow):
-                break
+        # num_whales=0 means "allowlist only" — skip the leaderboard
+        # pull entirely. Useful when the operator wants strict control
+        # over which traders the bot follows.
+        if cfg.strategy_e_num_whales > 0:
+            raw = await self._fetch_top_traders(
+                cfg.strategy_e_num_whales,
+                window=cfg.strategy_e_leaderboard_window,
+            )
+            for w in raw:
+                wlc = w.wallet.lower()
+                if wlc in seen:
+                    continue
+                seen.add(wlc)
+                whales.append(w)
+                if len(whales) >= cfg.strategy_e_num_whales + len(allow):
+                    break
 
         if not whales:
             return
         self._whales = whales
 
         n_allow = len(allow)
+        n_lb = len(self._whales) - n_allow
+        if cfg.strategy_e_num_whales == 0:
+            roster_desc = f"{n_allow} allowlisted (leaderboard disabled)"
+        else:
+            roster_desc = (
+                f"{n_allow} allowlisted + {n_lb} from "
+                f"{cfg.strategy_e_leaderboard_window} leaderboard"
+            )
         await self.state.db.log_event(
             "info", "strategy_e",
             f"watching {len(self._whales)} whales for clear-win signals "
-            f"({n_allow} allowlisted + {len(self._whales) - n_allow} from "
-            f"{cfg.strategy_e_leaderboard_window} leaderboard)",
+            f"({roster_desc})",
             {"whales": [
                 {"wallet": w.wallet, "pseudonym": w.pseudonym,
                  "pnl_window": w.pnl_window, "window": w.window}
