@@ -1,0 +1,596 @@
+"""Strategy E — clear-win sniper, validated by whale behaviour.
+
+The thesis (per public Polymarket research, e.g. Monolith VC's "5 ways to
+make $100k on Polymarket"): the highest-Sharpe trade on Polymarket is to
+buy markets priced ≥ $0.90 with imminent resolution. The expected return
+per trade is small (a few cents per dollar) but volatility is low and
+losses are rare, so compounding is strong. Several whales (Sharky6999,
+LlamaEnjoyer, rwo and similar) are known to specialise in this pattern.
+
+We don't try to identify "the" whales by name — instead we follow the
+PATTERN. We watch the top N traders over a long window and copy any
+BUY they place that fits the clear-win profile:
+
+  * ask ∈ [min_entry_price, max_entry_price]   (default 0.85–0.99)
+  * market resolves within max_hours_to_resolve (default 24h)
+  * whale's own bet was at least min_whale_bet_usdc (default $100)
+
+No consensus required: at price ≥ 0.85 a whale's individual signal is
+already saying "this is decided". No exits: positions ride to
+auto-redemption (PositionMonitor only touches 'D' and 'M', and the
+reconciler settles 'E' positions on disappearance from /positions).
+
+Compared to Strategy D:
+  * D copies any BUY from leaders; E copies only clear-win BUYs (any trader)
+  * D applies leader-blocklist + per-leader/category win-rate gates;
+    E doesn't — the pattern itself is the gate
+  * D uses consensus-buffer + slippage-ceiling; E uses just slippage
+  * D positions are exit-managed; E positions hold to resolution
+
+Risk notes:
+  * Tail risk: a single $0.95 → $0.00 flip wipes ~20 winning copies.
+    Keep min_entry_price high enough (>= 0.85) and max_hours short
+    enough (<= 24h) that the market really is decided.
+  * Markets that should be 0.99 but show 0.95 are usually slow-updating
+    NegRisk children — the spread is the tell. If best_bid + best_ask
+    diverges from 1.0 by more than spread_tolerance we skip.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import aiohttp
+from py_clob_client.client import ClobClient
+
+from capital.pools import get_trading_balance
+from config import get_config
+from execution.risk import OrderRequest
+from ingestion.state_manager import Signal, SignalKind, StateManager
+
+log = logging.getLogger(__name__)
+
+LEADERBOARD_URL = "https://lb-api.polymarket.com/profit"
+ACTIVITY_URL = "https://data-api.polymarket.com/activity"
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+
+WHALE_REFRESH_SECS = 3600  # re-pull leaderboard every hour
+MARKET_END_CACHE_SECS = 1800  # cache resolution_timestamp lookups for 30 min
+
+
+def _trade_size_usdc(trade: dict) -> float:
+    for key in ("size_usd", "usdcSize", "sizeUsd", "usd_size", "notional"):
+        v = trade.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    try:
+        return float(trade.get("size") or 0) * float(trade.get("price") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_iso_ts(s) -> Optional[int]:
+    """Parse Polymarket's endDate strings ('2026-04-26T00:00:00Z') into
+    unix seconds. Returns None for unparseable values."""
+    if not s:
+        return None
+    from datetime import datetime
+    try:
+        return int(datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+@dataclass
+class Whale:
+    wallet: str
+    pseudonym: str
+    pnl_window: float
+    window: str = "30d"
+
+
+class StrategyE:
+    """Whale-validated clear-win sniper. Holds to resolution."""
+
+    def __init__(self, state: StateManager, clob: Optional[ClobClient] = None):
+        self.state = state
+        self._clob = clob
+        self._running = False
+        self._seen_trade_ids: set[str] = set()
+        self._whales: list[Whale] = []
+        self._last_whale_refresh = 0.0
+        self._pending_usdc = 0.0
+        self._pending_lock = asyncio.Lock()
+        self._pending_hold_secs = 5.0
+        # token_id → (resolution_ts_or_None, fetched_at). None = unknown.
+        self._end_ts_cache: dict[str, tuple[Optional[int], float]] = {}
+        # (whale, token_id) → last_copy_ts. Iceberg dedup: these whales
+        # split a single buy across 20+ fills to hide size; without
+        # this cache we'd copy each fill and drain the pool on one
+        # market. After we copy once, ignore further fills from the
+        # same whale on the same token for STRATEGY_E_PER_TOKEN_COOLDOWN.
+        self._token_cooldown: dict[tuple[str, str], float] = {}
+
+    async def run(self) -> None:
+        self._running = True
+        log.info("strategy E starting")
+        try:
+            await self._refresh_whales(get_config())
+            self._last_whale_refresh = time.time()
+        except Exception:
+            log.exception("initial whale refresh failed")
+
+        while self._running:
+            cfg = get_config()
+            try:
+                if time.time() - self._last_whale_refresh > WHALE_REFRESH_SECS:
+                    await self._refresh_whales(cfg)
+                    self._last_whale_refresh = time.time()
+            except Exception:
+                log.exception("whale refresh failed")
+
+            if cfg.bot_enabled and cfg.strategy_e_enabled:
+                try:
+                    await self._tick(cfg)
+                except Exception:
+                    log.exception("strategy E tick failed")
+                    await self.state.db.log_event(
+                        "error", "strategy_e", "tick failed (see logs)"
+                    )
+            await asyncio.sleep(cfg.strategy_e_poll_secs)
+
+    def stop(self) -> None:
+        self._running = False
+
+    # ------------------------------------------------------------------
+    # Per-tick: poll each whale's recent trades, filter, copy
+    # ------------------------------------------------------------------
+    async def _tick(self, cfg) -> None:
+        if not self._whales:
+            return
+        now = int(time.time())
+        window_cutoff = now - cfg.strategy_e_copy_window_secs
+
+        # GC the per-token cooldown set so it doesn't grow forever.
+        cooldown_cutoff = now - cfg.strategy_e_per_token_cooldown_secs
+        self._token_cooldown = {
+            k: v for k, v in self._token_cooldown.items() if v >= cooldown_cutoff
+        }
+
+        results = await asyncio.gather(
+            *[self._fetch_recent_trades(w.wallet) for w in self._whales],
+            return_exceptions=True,
+        )
+
+        for whale, trades in zip(self._whales, results):
+            if isinstance(trades, Exception) or not trades:
+                continue
+
+            # Iceberg coalesce: these whales split a single conviction
+            # buy across many fills (e.g. 24 separate $1–$2k fills on
+            # one BTC 2AM market). Group fresh BUYs by token_id, then
+            # treat each token-group as one signal: sum the USDC across
+            # fills, take the latest timestamp/price, copy ONCE per
+            # (whale, token).
+            buys_by_token: dict[str, dict] = {}
+            for t in trades:
+                trade_id = str(t.get("transactionHash") or "")
+                if not trade_id or trade_id in self._seen_trade_ids:
+                    continue
+                self._seen_trade_ids.add(trade_id)
+
+                ts = int(t.get("timestamp") or 0)
+                if ts < window_cutoff:
+                    continue
+                if (t.get("side") or "").upper() != "BUY":
+                    continue
+                token_id = str(t.get("asset") or "")
+                their_price = float(t.get("price") or 0)
+                if not token_id or their_price <= 0:
+                    continue
+
+                grp = buys_by_token.setdefault(token_id, {
+                    "title": t.get("title") or "?",
+                    "outcome": t.get("outcome") or "?",
+                    "latest_ts": 0,
+                    "latest_price": 0.0,
+                    "fills": 0,
+                    "total_usdc": 0.0,
+                })
+                grp["fills"] += 1
+                grp["total_usdc"] += _trade_size_usdc(t)
+                if ts > grp["latest_ts"]:
+                    grp["latest_ts"] = ts
+                    grp["latest_price"] = their_price
+
+            for token_id, grp in buys_by_token.items():
+                key = (whale.wallet.lower(), token_id)
+                last_copied = self._token_cooldown.get(key, 0.0)
+                if last_copied >= cooldown_cutoff:
+                    # Already copied this whale on this market recently.
+                    # Don't even log — would spam during iceberg fills.
+                    continue
+
+                copied = await self._consider_copy(
+                    cfg, whale, token_id,
+                    their_price=grp["latest_price"],
+                    their_bet=grp["total_usdc"],
+                    title=grp["title"],
+                    outcome=grp["outcome"],
+                    trade_ts=grp["latest_ts"],
+                    fills=grp["fills"],
+                )
+                if copied:
+                    self._token_cooldown[key] = float(now)
+
+        # Cap memory: never let the seen set grow unbounded.
+        if len(self._seen_trade_ids) > 50_000:
+            self._seen_trade_ids = set(list(self._seen_trade_ids)[-25_000:])
+
+    # ------------------------------------------------------------------
+    # Whale roster
+    # ------------------------------------------------------------------
+    async def _refresh_whales(self, cfg) -> None:
+        # Allowlist whales are always tracked, regardless of leaderboard
+        # rank. The leaderboard cohort is "biggest 30d USD profit"; many
+        # high-win-rate small-bet specialists never make that list, so
+        # the operator can pin them via STRATEGY_E_WHALE_ALLOWLIST.
+        allow = [
+            w.strip().lower() for w in (cfg.strategy_e_whale_allowlist or "").split(",")
+            if w.strip()
+        ]
+        whales: list[Whale] = []
+        seen: set[str] = set()
+        for wallet in allow:
+            if wallet in seen:
+                continue
+            seen.add(wallet)
+            pseudonym = await self._lookup_pseudonym(wallet) or wallet[:10]
+            whales.append(Whale(
+                wallet=wallet,
+                pseudonym=pseudonym,
+                pnl_window=0.0,  # unknown from leaderboard; allowlist isn't ranked
+                window="allowlist",
+            ))
+
+        raw = await self._fetch_top_traders(
+            cfg.strategy_e_num_whales,
+            window=cfg.strategy_e_leaderboard_window,
+        )
+        for w in raw:
+            wlc = w.wallet.lower()
+            if wlc in seen:
+                continue
+            seen.add(wlc)
+            whales.append(w)
+            if len(whales) >= cfg.strategy_e_num_whales + len(allow):
+                break
+
+        if not whales:
+            return
+        self._whales = whales
+
+        n_allow = len(allow)
+        await self.state.db.log_event(
+            "info", "strategy_e",
+            f"watching {len(self._whales)} whales for clear-win signals "
+            f"({n_allow} allowlisted + {len(self._whales) - n_allow} from "
+            f"{cfg.strategy_e_leaderboard_window} leaderboard)",
+            {"whales": [
+                {"wallet": w.wallet, "pseudonym": w.pseudonym,
+                 "pnl_window": w.pnl_window, "window": w.window}
+                for w in self._whales
+            ]},
+        )
+        # Mirror to state for the dashboard.
+        self.state.e_whales = [
+            {"wallet": w.wallet, "pseudonym": w.pseudonym,
+             "pnl_window": w.pnl_window, "window": w.window}
+            for w in self._whales
+        ]
+        self.state.e_whales_refreshed_at = time.time()
+
+    async def _fetch_top_traders(self, limit: int, window: str) -> list[Whale]:
+        async def _try(w: str) -> list[Whale]:
+            timeout = aiohttp.ClientTimeout(total=15)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(
+                        LEADERBOARD_URL,
+                        params={"window": w, "limit": str(limit)},
+                    ) as r:
+                        if r.status != 200:
+                            return []
+                        data = await r.json()
+            except Exception as e:
+                log.warning("leaderboard fetch failed (%s): %s", w, e)
+                return []
+            entries = data if isinstance(data, list) else (
+                data.get("data") if isinstance(data, dict) else None
+            )
+            if not entries:
+                return []
+            out: list[Whale] = []
+            for e in entries:
+                wallet = e.get("proxyWallet")
+                if not wallet:
+                    continue
+                out.append(Whale(
+                    wallet=wallet,
+                    pseudonym=e.get("pseudonym") or e.get("name") or wallet[:10],
+                    pnl_window=float(e.get("amount") or 0),
+                    window=w,
+                ))
+            return out
+
+        result = await _try(window)
+        if result or window == "30d":
+            return result
+        log.info("leaderboard window %s empty — falling back to 30d", window)
+        return await _try("30d")
+
+    async def _lookup_pseudonym(self, wallet: str) -> Optional[str]:
+        """Best-effort name resolution for an allowlisted wallet.
+
+        Polymarket's data-api /positions endpoint returns the trader's
+        pseudonym alongside their positions, so a single GET gives us
+        a friendly label for log lines. Returns None on miss — caller
+        falls back to a wallet prefix.
+        """
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": wallet, "limit": "1"},
+                ) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+        except Exception:
+            return None
+        rows = data if isinstance(data, list) else (
+            data.get("data") if isinstance(data, dict) else None
+        ) or []
+        if not rows:
+            return None
+        return rows[0].get("pseudonym") or rows[0].get("name")
+
+    async def _fetch_recent_trades(
+        self, user: str, limit: int = 20,
+    ) -> list[dict]:
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(
+                    ACTIVITY_URL,
+                    params={"user": user, "limit": str(max(limit * 3, 50))},
+                ) as r:
+                    if r.status != 200:
+                        return []
+                    data = await r.json()
+        except Exception:
+            return []
+        entries = data if isinstance(data, list) else (
+            data.get("data") if isinstance(data, dict) else None
+        ) or []
+        return [e for e in entries if (e.get("type") or "").upper() == "TRADE"][:limit]
+
+    # ------------------------------------------------------------------
+    # Copy decision — clear-win profile filter, then size + execute
+    # ------------------------------------------------------------------
+    async def _consider_copy(
+        self, cfg, whale: Whale, token_id: str, their_price: float,
+        their_bet: float, title: str, outcome: str, trade_ts: int,
+        fills: int = 1,
+    ) -> bool:
+        # --- Whale conviction gate ---
+        # A whale dropping a token-amount trade with no real money behind
+        # it is just paying attention. The grinders we want often bet
+        # smaller than headline whales though — default is loose ($25).
+        # Set STRATEGY_E_MIN_WHALE_BET_USDC=0 to disable entirely.
+        if (
+            cfg.strategy_e_min_whale_bet_usdc > 0
+            and their_bet < cfg.strategy_e_min_whale_bet_usdc
+        ):
+            return False
+
+        # --- Price floor ---
+        # The whole edge is "the market is decided"; buying at 0.50 from
+        # a good trader is just copy-trading, which Strategy D handles.
+        # No price ceiling — operator preference: even at 0.99 the
+        # trade is fine if the whale is right and we're not paying
+        # meaningful slippage above their fill (the slippage cap below
+        # protects against chasing).
+        if their_price < cfg.strategy_e_min_entry_price:
+            return False
+
+        # --- Resolution-imminence gate ---
+        # The whole edge is "decided market with auto-redeem coming
+        # soon". Skip if endDate is far out or unknown (better to miss
+        # than guess wrong on tail risk).
+        end_ts = await self._market_end_ts(token_id)
+        now = int(time.time())
+        if end_ts is None:
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (no resolution time known): {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "their_price": their_price},
+            )
+            return False
+        hours_to_resolve = (end_ts - now) / 3600.0
+        if hours_to_resolve > cfg.strategy_e_max_hours_to_resolve:
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (resolves in {hours_to_resolve:.1f}h > cap "
+                f"{cfg.strategy_e_max_hours_to_resolve:.1f}h): "
+                f"{title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "hours_to_resolve": hours_to_resolve},
+            )
+            return False
+        if hours_to_resolve < 0:
+            # Resolution timestamp passed but the market still trades —
+            # extension or stale endDate. Skip rather than buy something
+            # whose true resolve time we can't pin down.
+            return False
+
+        # --- Live ask check ---
+        current_ask = await self._live_best_ask(token_id)
+        if current_ask is None:
+            return False
+
+        if current_ask < cfg.strategy_e_min_entry_price:
+            return False
+
+        # Slippage cap: don't chase if the ask has moved up significantly
+        # since the whale filled. At these prices a 2¢ move is meaningful.
+        slip_cap = their_price + cfg.strategy_e_max_price_slippage_abs
+        if current_ask > slip_cap:
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip slippage: whale@{their_price:.3f} now {current_ask:.3f} "
+                f"(cap {slip_cap:.3f}): {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "their_price": their_price, "current_ask": current_ask},
+            )
+            return False
+
+        # --- Sizing ---
+        async with self._pending_lock:
+            pool = await get_trading_balance(self.state.db)
+            effective_available = pool - self._pending_usdc
+            base_size = pool * cfg.strategy_e_deploy_rate
+            desired = min(base_size, cfg.strategy_e_max_position)
+            deployable = max(0.0, effective_available - cfg.trading_pool_pause_threshold)
+            size = min(desired, deployable)
+            if size < cfg.min_order_size:
+                # Pool full — silent skip; would spam during iceberg fills.
+                return False
+            self._pending_usdc += size
+
+        req = OrderRequest(
+            strategy="E",
+            token_id=token_id,
+            side="BUY",
+            limit_price=round(current_ask, 4),
+            size_usdc=round(size, 2),
+            memo=(
+                f"strategy_e snipe {whale.pseudonym[:16]}@{their_price:.3f} "
+                f"({outcome}, ~{hours_to_resolve:.1f}h to resolve)"
+            ),
+            leader_wallet=whale.wallet,
+        )
+        lag_secs = int(time.time()) - trade_ts
+        fills_str = f", {fills} fills" if fills > 1 else ""
+        await self.state.db.log_event(
+            "info", "strategy_e",
+            f"SNIPE {whale.pseudonym}: BUY ${size:.2f}@{current_ask:.4f} "
+            f"({outcome}, whale@{their_price:.3f} bet ${their_bet:.0f}{fills_str}, "
+            f"resolves in {hours_to_resolve:.1f}h, {lag_secs}s lag): {title[:60]}",
+            {"whale_wallet": whale.wallet, "whale_pseudonym": whale.pseudonym,
+             "token_id": token_id, "their_price": their_price,
+             "their_bet_usdc": their_bet, "fills": fills,
+             "our_price": current_ask,
+             "size": size, "lag_secs": lag_secs,
+             "hours_to_resolve": hours_to_resolve,
+             "title": title, "outcome": outcome},
+        )
+        await self.state.emit(
+            self.state.execution_queue,
+            Signal(
+                kind=SignalKind.ORDER_REQUEST,
+                payload={"order": req},
+                source="strategy_e",
+            ),
+        )
+        asyncio.create_task(self._release_slot(size))
+        return True
+
+    async def _release_slot(self, reserved: float) -> None:
+        await asyncio.sleep(self._pending_hold_secs)
+        async with self._pending_lock:
+            self._pending_usdc = max(0.0, self._pending_usdc - reserved)
+
+    # ------------------------------------------------------------------
+    # Market metadata helpers
+    # ------------------------------------------------------------------
+    async def _market_end_ts(self, token_id: str) -> Optional[int]:
+        """Resolve a token to its market endDate (unix seconds).
+
+        Cheap path: read resolution_timestamp from the markets table.
+        Fallback: live gamma fetch by clobTokenIds=token_id, cached so we
+        don't hammer gamma per tick. Cache is per-token; misses persist
+        for MARKET_END_CACHE_SECS so we don't keep retrying brand-new
+        markets gamma hasn't indexed yet.
+        """
+        cached = self._end_ts_cache.get(token_id)
+        now = time.time()
+        if cached and (now - cached[1]) < MARKET_END_CACHE_SECS:
+            return cached[0]
+
+        row = await self.state.db.fetchone(
+            "SELECT resolution_timestamp FROM markets WHERE token_id = ?",
+            (token_id,),
+        )
+        if row and row["resolution_timestamp"]:
+            ts = int(row["resolution_timestamp"])
+            self._end_ts_cache[token_id] = (ts, now)
+            return ts
+
+        # Not in our registry yet — try gamma directly.
+        ts = await self._fetch_end_ts_from_gamma(token_id)
+        self._end_ts_cache[token_id] = (ts, now)
+        return ts
+
+    async def _fetch_end_ts_from_gamma(self, token_id: str) -> Optional[int]:
+        """Look up a market by its clobTokenId and return endDate (unix s)."""
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(
+                    GAMMA_MARKETS_URL,
+                    params={"clob_token_ids": token_id},
+                ) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+        except Exception:
+            return None
+
+        rows = data if isinstance(data, list) else (
+            data.get("data") if isinstance(data, dict) else None
+        ) or []
+        if not rows:
+            return None
+        row = rows[0]
+        end_str = (
+            row.get("endDate")
+            or row.get("end_date_iso")
+            or row.get("end_date")
+        )
+        return _parse_iso_ts(end_str)
+
+    async def _live_best_ask(self, token_id: str) -> Optional[float]:
+        if self._clob is None:
+            return None
+        try:
+            book = await asyncio.to_thread(self._clob.get_order_book, token_id)
+        except Exception as e:
+            log.debug("live book fetch failed for %s: %s", token_id, e)
+            return None
+        asks = getattr(book, "asks", None) or (
+            book.get("asks") if isinstance(book, dict) else None
+        ) or []
+        if not asks:
+            return None
+        def _price(e) -> float:
+            return float(getattr(e, "price", None) or e["price"])
+        return min(_price(a) for a in asks)

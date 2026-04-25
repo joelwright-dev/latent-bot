@@ -100,6 +100,23 @@ class Config:
     # --- Inverse copy (opt-in meta strategy) ---
     strategy_d_inverse_copy: bool         # when true, buy OPPOSITE outcome of leader BUY
 
+    # Strategy E — clear-win sniper (whale-validated)
+    # Watches top traders for high-confidence buys near resolution
+    # (price >= 0.85, resolves within N hours). Holds to auto-redeem.
+    strategy_e_enabled: bool
+    strategy_e_poll_secs: int
+    strategy_e_num_whales: int                  # how many top traders to scan
+    strategy_e_leaderboard_window: str          # "7d"/"30d"/"90d" — 30d preferred
+    strategy_e_copy_window_secs: int            # only copy whale trades within N sec of now
+    strategy_e_min_entry_price: float           # skip buys below this (whole edge is "decided")
+    strategy_e_max_hours_to_resolve: float      # skip markets with endDate further out than this
+    strategy_e_max_position: float              # absolute USD cap per snipe
+    strategy_e_deploy_rate: float               # fraction of pool per snipe (small = more diversification)
+    strategy_e_min_whale_bet_usdc: float        # only follow whale trades >= this size (0 = disable)
+    strategy_e_max_price_slippage_abs: float    # don't chase if ask moved up by more than $X since whale fill
+    strategy_e_whale_allowlist: str             # comma-separated wallets always tracked (in addition to leaderboard cohort)
+    strategy_e_per_token_cooldown_secs: int     # after one copy on (whale, market), ignore further fills for N secs (iceberg dedup)
+
     # PositionMonitor (auto-exit logic for Strategy D copy trades)
     monitor_enabled: bool
     monitor_poll_secs: int
@@ -116,6 +133,15 @@ class Config:
     # Trader-exit signal: if a copied leader sells their side, we exit too.
     monitor_trader_exit_enabled: bool
     monitor_trader_exit_window_min: int   # only follow leader sells within last N minutes
+
+    # Reconciler auto-drift correction
+    # Pool ledger drifts negative over time because settlements credit
+    # the last-known cashPnl rather than the actual on-chain payout.
+    # The reconciler can auto-debit this drift on each cycle. Capped to
+    # prevent a flaky RPC reading from nuking the pool.
+    reconciler_auto_drift_enabled: bool
+    reconciler_drift_min_correct: float    # below this absolute USD, ignore (noise)
+    reconciler_drift_max_correct: float    # above this single-cycle USD, log + skip (manual review)
 
     # Web dashboard
     dashboard_host: str
@@ -231,6 +257,23 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_category_min_trades=_i(values.get("STRATEGY_D_CATEGORY_MIN_TRADES"), 5),
         strategy_d_category_min_win_rate=_f(values.get("STRATEGY_D_CATEGORY_MIN_WIN_RATE"), 0.40),
         strategy_d_inverse_copy=_b(values.get("STRATEGY_D_INVERSE_COPY"), False),
+        strategy_e_enabled=_b(values.get("STRATEGY_E_ENABLED"), True),
+        strategy_e_poll_secs=_i(values.get("STRATEGY_E_POLL_SECS"), 60),
+        strategy_e_num_whales=_i(values.get("STRATEGY_E_NUM_WHALES"), 30),
+        strategy_e_leaderboard_window=_s(values.get("STRATEGY_E_LEADERBOARD_WINDOW"), "30d"),
+        strategy_e_copy_window_secs=_i(values.get("STRATEGY_E_COPY_WINDOW_SECS"), 600),
+        strategy_e_min_entry_price=_f(values.get("STRATEGY_E_MIN_ENTRY_PRICE"), 0.85),
+        strategy_e_max_hours_to_resolve=_f(values.get("STRATEGY_E_MAX_HOURS_TO_RESOLVE"), 24.0),
+        strategy_e_max_position=_f(values.get("STRATEGY_E_MAX_POSITION"), 5.0),
+        strategy_e_deploy_rate=_f(values.get("STRATEGY_E_DEPLOY_RATE"), 0.10),
+        strategy_e_min_whale_bet_usdc=_f(values.get("STRATEGY_E_MIN_WHALE_BET_USDC"), 0.0),
+        strategy_e_per_token_cooldown_secs=_i(values.get("STRATEGY_E_PER_TOKEN_COOLDOWN_SECS"), 3600),
+        strategy_e_max_price_slippage_abs=_f(values.get("STRATEGY_E_MAX_PRICE_SLIPPAGE_ABS"), 0.02),
+        strategy_e_whale_allowlist=_s(
+            values.get("STRATEGY_E_WHALE_ALLOWLIST"),
+            "0x9b979a065641e8cfde3022a30ed2d9415cf55e12,"
+            "0x751a2b86cab503496efd325c8344e10159349ea1",
+        ),
         monitor_enabled=_b(values.get("MONITOR_ENABLED"), True),
         monitor_poll_secs=_i(values.get("MONITOR_POLL_SECS"), 30),
         monitor_max_loss_pct=_f(values.get("MONITOR_MAX_LOSS_PCT"), 0.60),
@@ -243,6 +286,9 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         monitor_min_hold_secs=_i(values.get("MONITOR_MIN_HOLD_SECS"), 300),
         monitor_trader_exit_enabled=_b(values.get("MONITOR_TRADER_EXIT_ENABLED"), True),
         monitor_trader_exit_window_min=_i(values.get("MONITOR_TRADER_EXIT_WINDOW_MIN"), 15),
+        reconciler_auto_drift_enabled=_b(values.get("RECONCILER_AUTO_DRIFT_ENABLED"), True),
+        reconciler_drift_min_correct=_f(values.get("RECONCILER_DRIFT_MIN_CORRECT"), 0.05),
+        reconciler_drift_max_correct=_f(values.get("RECONCILER_DRIFT_MAX_CORRECT"), 5.00),
         dashboard_host=_s(values.get("DASHBOARD_HOST"), "0.0.0.0"),
         dashboard_port=_i(values.get("DASHBOARD_PORT"), 8080),
         dashboard_secret=_s(values.get("DASHBOARD_SECRET"), "changeme"),

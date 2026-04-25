@@ -92,6 +92,11 @@ class StateManager:
         # (num_leaders, leaderboard_window, etc.).
         self.d_force_refresh: bool = False
 
+        # Strategy E whale roster — same shape, separate list because E
+        # uses a different leaderboard window and broader filter than D.
+        self.e_whales: list[dict] = []
+        self.e_whales_refreshed_at: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Boot
     # ------------------------------------------------------------------

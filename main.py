@@ -67,6 +67,7 @@ from strategies.strategy_a import StrategyA
 from strategies.strategy_b import StrategyB
 from strategies.strategy_c import StrategyC
 from strategies.strategy_d import StrategyD
+from strategies.strategy_e import StrategyE
 from web.api import create_app, ws_fanout_loop
 
 logging.basicConfig(
@@ -136,6 +137,7 @@ async def main() -> None:
     strat_b = StrategyB(state, graph=graph)
     strat_c = StrategyC(state, clob=clob)
     strat_d = StrategyD(state, clob=clob)
+    strat_e = StrategyE(state, clob=clob)
     graph_builder = GraphBuilder(state, graph)
     executor = Executor(state)
     settlement = Settlement(state, clob=clob)
@@ -151,7 +153,7 @@ async def main() -> None:
     def _signal(*_):
         log.info("shutdown signal received")
         stop_event.set()
-        for c in (polygon, ws_in, seeder, reconciler, graph_builder, strat_a, strat_b, strat_c, strat_d, executor, settlement, monitor):
+        for c in (polygon, ws_in, seeder, reconciler, graph_builder, strat_a, strat_b, strat_c, strat_d, strat_e, executor, settlement, monitor):
             try:
                 c.stop()
             except Exception:
@@ -177,6 +179,7 @@ async def main() -> None:
         asyncio.create_task(strat_b.run(),     name="strategy_b"),
         asyncio.create_task(strat_c.run(),     name="strategy_c"),
         asyncio.create_task(strat_d.run(),     name="strategy_d"),
+        asyncio.create_task(strat_e.run(),     name="strategy_e"),
         asyncio.create_task(executor.run(),    name="executor"),
         asyncio.create_task(settlement.run(),  name="settlement"),
         asyncio.create_task(monitor.run(),     name="position_monitor"),

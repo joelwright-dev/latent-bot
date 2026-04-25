@@ -295,6 +295,14 @@ def create_app(state: StateManager) -> FastAPI:
                 "today":   await bucket(day_ago, "B"),
                 "alltime": await all_time("B"),
             },
+            "strategy_d": {
+                "today":   await bucket(day_ago, "D"),
+                "alltime": await all_time("D"),
+            },
+            "strategy_e": {
+                "today":   await bucket(day_ago, "E"),
+                "alltime": await all_time("E"),
+            },
         }
 
     # ------------------------------------------------------------------
@@ -508,8 +516,8 @@ def create_app(state: StateManager) -> FastAPI:
     async def toggle_strategy(body: dict) -> dict:
         which = body.get("strategy")
         enabled = bool(body.get("enabled"))
-        if which not in ("A", "B", "C", "D"):
-            raise HTTPException(status_code=400, detail="strategy must be 'A','B','C' or 'D'")
+        if which not in ("A", "B", "C", "D", "E"):
+            raise HTTPException(status_code=400, detail="strategy must be 'A','B','C','D' or 'E'")
         key = f"STRATEGY_{which}_ENABLED"
         await update_config({key: enabled})
         await state.broadcast(Signal(
@@ -857,44 +865,14 @@ def create_app(state: StateManager) -> FastAPI:
     # ------------------------------------------------------------------
     # GET /api/portfolio — mirror of Polymarket's positions endpoint
     # ------------------------------------------------------------------
-    # USDC.e (bridged) is what Polymarket actually uses for cash, held
-    # at the proxy wallet on Polygon. We query its balanceOf directly
-    # via the configured Polygon RPC — data-api has no wallet-cash
-    # endpoint (/value returns positions' current value, not cash).
-    USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    ERC20_BALANCE_OF = "0x70a08231"
+    # On-chain USDC.e read lives in ingestion/onchain.py so the reconciler
+    # can share it. Local alias keeps existing call sites readable.
+    from ingestion.onchain import fetch_usdc_e_balance as _shared_usdc_e
 
     async def _fetch_usdc_e_balance(
         session: aiohttp.ClientSession, wallet: str, rpc_url: str
     ) -> Optional[float]:
-        if not rpc_url or not wallet:
-            return None
-        addr = wallet[2:].lower() if wallet.startswith("0x") else wallet.lower()
-        call_data = ERC20_BALANCE_OF + addr.rjust(64, "0")
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [
-                {"to": USDC_E_ADDRESS, "data": call_data},
-                "latest",
-            ],
-            "id": 1,
-        }
-        try:
-            async with session.post(rpc_url, json=payload) as r:
-                if r.status != 200:
-                    return None
-                doc = await r.json()
-        except Exception:
-            return None
-        hex_result = (doc or {}).get("result")
-        if not hex_result or not isinstance(hex_result, str):
-            return None
-        try:
-            raw = int(hex_result, 16)
-        except ValueError:
-            return None
-        return raw / 1_000_000.0  # USDC.e has 6 decimals
+        return await _shared_usdc_e(wallet, rpc_url, session=session)
 
     @app.get("/api/portfolio")
     async def portfolio() -> dict:
@@ -1452,8 +1430,8 @@ def create_app(state: StateManager) -> FastAPI:
             "pools": {
                 "trading_balance": trading_bal,
                 "gain_balance": gain_bal,
-                "locked_in_open_positions": float(locked_open or 0.0),
-                "available_to_deploy": trading_bal - float(locked_open or 0.0),
+                "principal_in_open_positions": float(locked_open or 0.0),
+                "available_to_deploy": trading_bal,
                 "recent_ledger": [dict(r) for r in ledger_rows],
             },
             "positions_summary": {

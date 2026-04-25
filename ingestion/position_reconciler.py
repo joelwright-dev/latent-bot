@@ -23,8 +23,9 @@ from typing import Optional
 
 import aiohttp
 
-from capital.pools import get_trading_balance, settle_trade
+from capital.pools import get_gain_balance, get_trading_balance, settle_trade
 from config import get_config
+from ingestion.onchain import fetch_usdc_e_balance
 from ingestion.state_manager import StateManager
 
 log = logging.getLogger(__name__)
@@ -286,6 +287,104 @@ class PositionReconciler:
                 {"added": added, "auto_settled": settled_auto,
                  "pm_count": len(pm_by_token)},
             )
+
+        # Auto-correct ledger drift. If a settlement just landed, give the
+        # on-chain redeem a few seconds to clear before reading the wallet.
+        if settled_auto > 0:
+            await asyncio.sleep(20)
+        await self._auto_correct_drift(triggered_by_settle=settled_auto > 0)
+
+    # ------------------------------------------------------------------
+    # Auto drift correction
+    # ------------------------------------------------------------------
+    # Settlement is driven by Polymarket's last-known cashPnl snapshot,
+    # which can lag the actual on-chain payout (e.g. position trending
+    # toward zero is polled at $0.30, market resolves NO and pays $0).
+    # Over many trades these small mis-credits accumulate. Rather than
+    # try to plug every micro-drift at source, we periodically reconcile
+    # the ledger to the wallet's actual USDC.e balance — same logic as
+    # the manual /api/capital/reconcile-to-onchain endpoint.
+    async def _auto_correct_drift(self, *, triggered_by_settle: bool) -> None:
+        cfg = get_config()
+        if not cfg.reconciler_auto_drift_enabled:
+            return
+        wallet = cfg.polymarket_proxy_address
+        if not wallet or not cfg.polygon_rpc_url:
+            return
+
+        on_chain = await fetch_usdc_e_balance(wallet, cfg.polygon_rpc_url)
+        if on_chain is None:
+            return
+
+        db = self.state.db
+        trading = await get_trading_balance(db)
+        gain = await get_gain_balance(db)
+        drift = round((trading + gain) - on_chain, 6)
+
+        # drift > 0  → ledger thinks we have more cash than we do (over-credited
+        #              somewhere, usually a near-zero auto-redeem). Debit.
+        # drift < 0  → ledger thinks we have less than we do. Almost always
+        #              means the user manually deposited; surface the gap but
+        #              don't auto-credit (would mask real bugs going the other
+        #              way and could double-count a deposit).
+        if drift <= cfg.reconciler_drift_min_correct:
+            if drift < -1.0:
+                await db.log_event(
+                    "info", "reconciler",
+                    f"on-chain ${on_chain:.2f} > ledger ${trading + gain:.2f} "
+                    f"(diff ${-drift:.2f}); not auto-crediting — deposit?",
+                )
+            return
+
+        # Cap a single auto-correction so a flaky RPC or unexpected state
+        # can't nuke the pool. Over-cap drifts wait for the user.
+        if drift > cfg.reconciler_drift_max_correct:
+            await db.log_event(
+                "warn", "reconciler",
+                f"drift ${drift:.2f} exceeds auto-correct cap "
+                f"${cfg.reconciler_drift_max_correct:.2f}; skipping — "
+                f"use the dashboard reconcile button to apply manually",
+            )
+            return
+
+        # Debit trading first; spill into gain if trading can't absorb it.
+        from_trading = min(drift, max(0.0, trading))
+        from_gain = max(0.0, drift - from_trading)
+        memo = (f"auto-reconcile drift ${drift:.2f}"
+                + (" (post-settle)" if triggered_by_settle else ""))
+
+        async with db.transaction() as conn:
+            if from_trading > 0:
+                new_trading = trading - from_trading
+                await conn.execute(
+                    "INSERT INTO pool_ledger(timestamp, event_type, amount, "
+                    "pool, balance_after, position_id, memo) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (int(time.time()), "adjustment", -from_trading, "trading",
+                     new_trading, None, memo),
+                )
+            if from_gain > 0:
+                new_gain = gain - from_gain
+                await conn.execute(
+                    "INSERT INTO pool_ledger(timestamp, event_type, amount, "
+                    "pool, balance_after, position_id, memo) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (int(time.time()), "adjustment", -from_gain, "gain",
+                     gain - from_gain, None, memo),
+                )
+
+        log.info(
+            "auto-reconciled drift: %.4f (trading -%.4f, gain -%.4f) "
+            "on_chain=%.4f → ledger=%.4f",
+            drift, from_trading, from_gain, on_chain, on_chain,
+        )
+        await db.log_event(
+            "info", "reconciler",
+            f"auto-reconciled drift -${drift:.2f}: "
+            f"on-chain ${on_chain:.2f} = ledger ${on_chain:.2f}",
+            {"drift": drift, "from_trading": from_trading,
+             "from_gain": from_gain, "on_chain": on_chain},
+        )
 
     async def _settle_from_snapshot(self, row) -> None:
         """Position disappeared from PM → was auto-redeemed.
