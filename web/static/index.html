@@ -418,6 +418,168 @@
       </div>
     </section>
 
+    <!-- STRATEGY E WHALES (roster + recent trades) -->
+    <section v-if="tab === 'whales'" class="space-y-4">
+      <div class="flex items-center gap-3">
+        <div class="text-xs text-slate-500">
+          Whales Strategy E is watching for clear-win signals. Allowlisted wallets are pinned;
+          the rest come from the {{ config.strategy_e_leaderboard_window || '30d' }} leaderboard.
+          Green ticks = trade we sniped.
+          <span v-if="!config.strategy_e_enabled" class="text-amber-400">(Strategy E is OFF)</span>
+          <span v-if="whalesMeta.refreshed_at" class="text-slate-600 ml-2">
+            last refreshed {{ fmtAge(Math.floor(whalesMeta.refreshed_at)) }} ago
+          </span>
+        </div>
+        <button class="btn ml-auto" @click="loadWhales" title="Re-read current roster + each whale's recent trades from the API">refresh view</button>
+      </div>
+      <div v-if="whales.length === 0" class="card p-6 text-center text-slate-500">
+        {{ whalesMeta.note || 'No whales loaded yet.' }}
+      </div>
+      <div v-for="w in whales" :key="w.wallet" class="card p-3 sm:p-4 space-y-3">
+        <div class="flex items-baseline gap-2 sm:gap-3 flex-wrap">
+          <div class="text-base sm:text-lg font-semibold">{{ w.pseudonym }}</div>
+          <div class="text-xs sm:text-sm text-slate-500 num">{{ w.wallet.slice(0, 8) }}…{{ w.wallet.slice(-4) }}</div>
+          <span v-if="w.window === 'allowlist'" class="pill bg-indigo-900 text-indigo-200 text-xs">📌 allowlisted</span>
+          <div class="sm:ml-auto flex gap-2 sm:gap-4 items-baseline flex-wrap w-full sm:w-auto">
+            <span v-if="w.window !== 'allowlist'" class="text-xs text-slate-500">{{ w.window || '30d' }}</span>
+            <span v-if="w.window !== 'allowlist'" class="text-emerald-400 num font-semibold">${{ fmt(w.pnl_window, 0) }}</span>
+            <span class="text-xs text-slate-500">last</span>
+            <span class="num text-slate-300 text-xs sm:text-sm">{{ w.last_trade_age_secs == null ? '—' : fmtAgeDelta(w.last_trade_age_secs) + ' ago' }}</span>
+          </div>
+        </div>
+        <div v-if="w.copy_stats" class="flex flex-wrap gap-2 text-xs">
+          <span class="pill bg-slate-800 text-slate-300">
+            snipes: {{ w.copy_stats.settled }} settled
+            <span v-if="w.copy_stats.open_positions > 0">+ {{ w.copy_stats.open_positions }} open</span>
+          </span>
+          <span v-if="w.copy_stats.settled > 0" class="pill"
+            :class="w.copy_stats.pnl >= 0 ? 'bg-emerald-900 text-emerald-200' : 'bg-rose-900 text-rose-200'">
+            P&L ${{ fmt(w.copy_stats.pnl, 2) }}
+          </span>
+          <span v-if="w.copy_stats.win_rate !== null" class="pill"
+            :class="w.copy_stats.win_rate >= 0.6 ? 'bg-emerald-900 text-emerald-200' : 'bg-amber-900 text-amber-200'">
+            {{ (w.copy_stats.win_rate * 100).toFixed(0) }}% wins
+          </span>
+        </div>
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th style="min-width: 300px">Market</th>
+              <th>Outcome</th>
+              <th>Side</th>
+              <th class="text-right">Price</th>
+              <th class="text-right">$USDC</th>
+              <th>When</th>
+              <th>Sniped</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="t in w.trades" :key="t.tx_hash">
+              <td class="truncate" style="max-width: 420px">{{ t.title || '—' }}</td>
+              <td class="text-slate-400">{{ t.outcome }}</td>
+              <td>
+                <span class="pill" :class="t.side === 'BUY' ? 'bg-emerald-900 text-emerald-200' : 'bg-rose-900 text-rose-200'">
+                  {{ t.side }}
+                </span>
+              </td>
+              <td class="text-right num" :class="t.price >= 0.95 ? 'text-emerald-300' : 'text-slate-300'">{{ fmt(t.price, 4) }}</td>
+              <td class="text-right num" :class="t.size_usdc >= 100 ? 'text-amber-300' : 'text-slate-400'">${{ fmt(t.size_usdc, 0) }}</td>
+              <td class="num text-slate-500">{{ fmtAgeDelta(t.age_secs) }} ago</td>
+              <td>
+                <span v-if="t.copied_by_us" class="pill bg-emerald-700 text-emerald-100">✓ sniped</span>
+                <span v-else class="text-slate-600">—</span>
+              </td>
+            </tr>
+            <tr v-if="w.trades.length === 0">
+              <td colspan="7" class="text-center text-slate-500 py-4">No recent trades</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- STRATEGY E ANALYTICS — headline numbers + per-whale ranking -->
+    <section v-if="tab === 'strategy e'" class="space-y-4">
+      <div class="flex items-center gap-3">
+        <div class="text-xs text-slate-500">
+          Strategy E performance — settled snipes, per-whale PnL ranking.
+          <button class="btn ml-2" @click="loadWhales">refresh</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div class="card p-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Today P&L</div>
+          <div class="text-xl font-semibold num mt-1" :class="(stats.strategy_e?.today?.gain ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+            ${{ fmt(stats.strategy_e?.today?.gain) }}
+          </div>
+          <div class="text-xs text-slate-500 num">{{ stats.strategy_e?.today?.count || 0 }} settled</div>
+        </div>
+        <div class="card p-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">All-time P&L</div>
+          <div class="text-xl font-semibold num mt-1" :class="(stats.strategy_e?.alltime?.gain ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'">
+            ${{ fmt(stats.strategy_e?.alltime?.gain) }}
+          </div>
+          <div class="text-xs text-slate-500 num">{{ stats.strategy_e?.alltime?.count || 0 }} settled</div>
+        </div>
+        <div class="card p-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Whales tracked</div>
+          <div class="text-xl font-semibold num mt-1">{{ whales.length }}</div>
+          <div class="text-xs text-slate-500 num">{{ whales.filter(w => w.window === 'allowlist').length }} allowlisted</div>
+        </div>
+        <div class="card p-3">
+          <div class="text-xs text-slate-500 uppercase tracking-wider">Status</div>
+          <div class="text-xl font-semibold mt-1" :class="config.strategy_e_enabled ? 'text-emerald-400' : 'text-amber-400'">
+            {{ config.strategy_e_enabled ? 'ON' : 'OFF' }}
+          </div>
+          <div class="text-xs text-slate-500">poll {{ config.strategy_e_poll_secs || 60 }}s</div>
+        </div>
+      </div>
+      <div class="card p-3 sm:p-4 space-y-2">
+        <div class="text-xs text-slate-500 uppercase tracking-wider">Per-whale ranking</div>
+        <table class="tbl w-full">
+          <thead>
+            <tr>
+              <th>Whale</th>
+              <th>Source</th>
+              <th class="text-right">Settled</th>
+              <th class="text-right">Open</th>
+              <th class="text-right">Wins</th>
+              <th class="text-right">Win rate</th>
+              <th class="text-right">P&amp;L</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="w in [...whales].sort((a,b) => (b.copy_stats?.pnl ?? 0) - (a.copy_stats?.pnl ?? 0))" :key="w.wallet">
+              <td>
+                <div class="font-medium">{{ w.pseudonym }}</div>
+                <div class="text-xs text-slate-500 num">{{ w.wallet.slice(0, 8) }}…{{ w.wallet.slice(-4) }}</div>
+              </td>
+              <td>
+                <span v-if="w.window === 'allowlist'" class="pill bg-indigo-900 text-indigo-200 text-xs">📌 allow</span>
+                <span v-else class="pill bg-slate-800 text-slate-400 text-xs">{{ w.window }}</span>
+              </td>
+              <td class="text-right num">{{ w.copy_stats?.settled || 0 }}</td>
+              <td class="text-right num text-slate-400">{{ w.copy_stats?.open_positions || 0 }}</td>
+              <td class="text-right num">{{ w.copy_stats?.wins || 0 }}</td>
+              <td class="text-right num"
+                :class="w.copy_stats?.win_rate == null ? 'text-slate-600' : (w.copy_stats.win_rate >= 0.6 ? 'text-emerald-400' : 'text-amber-400')">
+                {{ w.copy_stats?.win_rate == null ? '—' : (w.copy_stats.win_rate * 100).toFixed(0) + '%' }}
+              </td>
+              <td class="text-right num"
+                :class="(w.copy_stats?.pnl ?? 0) === 0 ? 'text-slate-600' : ((w.copy_stats?.pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400')">
+                {{ w.copy_stats?.pnl == null ? '—' : '$' + fmt(w.copy_stats.pnl, 2) }}
+              </td>
+            </tr>
+            <tr v-if="whales.length === 0">
+              <td colspan="7" class="text-center text-slate-500 py-4">
+                {{ whalesMeta.note || 'No whales loaded — visit the whales tab.' }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- STRATEGY D ANALYTICS -->
     <section v-if="tab === 'strategy d'" class="space-y-4">
       <div class="flex items-center gap-3">
@@ -1182,13 +1344,31 @@
     </section>
 
     <!-- EVENTS -->
-    <section v-if="tab === 'events'" class="card p-2 max-h-[70vh] overflow-auto">
-      <div v-for="e in events" :key="e.id" class="log-line" :class="'log-' + e.level">
-        <span class="text-slate-500 num">{{ fmtDate(e.timestamp) }}</span>
-        <span class="ml-2 text-slate-400">[{{ e.source }}]</span>
-        <span class="ml-2">{{ e.message }}</span>
+    <section v-if="tab === 'events'" class="space-y-2">
+      <div class="card p-3 flex flex-wrap items-center gap-2">
+        <span class="text-xs text-slate-500 uppercase tracking-wider mr-1">filter</span>
+        <button class="pill cursor-pointer text-xs"
+          :class="eventFilter === '' ? 'bg-slate-200 text-slate-900' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'"
+          @click="eventFilter = ''">all <span class="num text-slate-500">({{ events.length }})</span></button>
+        <button v-for="s in eventSources" :key="s.key"
+          class="pill cursor-pointer text-xs flex items-center gap-1"
+          :class="eventFilter === s.key ? s.activeCls : (s.idleCls + ' hover:opacity-80')"
+          @click="eventFilter = s.key">
+          {{ s.label }}
+          <span class="num text-xs opacity-70">({{ s.count }})</span>
+        </button>
+        <span v-if="config.strategy_e_enabled === false" class="ml-auto text-xs text-amber-400">Strategy E is OFF — no whale snipes will fire</span>
       </div>
-      <div v-if="events.length === 0" class="text-slate-500 text-center py-6">No events.</div>
+      <div class="card p-2 max-h-[70vh] overflow-auto">
+        <div v-for="e in filteredEvents" :key="e.id" class="log-line" :class="'log-' + e.level">
+          <span class="text-slate-500 num">{{ fmtDate(e.timestamp) }}</span>
+          <span class="ml-2 pill text-xs num" :class="sourceCls(e.source)">{{ e.source }}</span>
+          <span class="ml-2">{{ e.message }}</span>
+        </div>
+        <div v-if="filteredEvents.length === 0" class="text-slate-500 text-center py-6">
+          {{ eventFilter ? 'No events matching this filter yet.' : 'No events.' }}
+        </div>
+      </div>
     </section>
 
   </main>
@@ -1200,7 +1380,7 @@ const { createApp, reactive, ref, onMounted, computed, watch } = Vue;
 createApp({
   setup() {
     const tab = ref('overview');
-    const tabs = ['overview', 'portfolio', 'upcoming', 'leaders', 'strategy d', 'backtest', 'graph', 'positions', 'history', 'capital', 'config', 'events'];
+    const tabs = ['overview', 'portfolio', 'upcoming', 'leaders', 'strategy d', 'whales', 'strategy e', 'backtest', 'graph', 'positions', 'history', 'capital', 'config', 'events'];
     const secret = ref(localStorage.getItem('latentbot.secret') || '');
     const saveSecret = () => localStorage.setItem('latentbot.secret', secret.value);
 
@@ -1211,6 +1391,59 @@ createApp({
     const draft = reactive({});
     const ledger = ref([]);
     const events = ref([]);
+    const eventFilter = ref('');
+
+    // Visual identity per event source. Tailwind classes baked in so the
+    // pills are readable in both light and dark themes; idle pills are
+    // muted, active (selected filter) pills are saturated.
+    const sourceStyles = {
+      strategy_a: { label: 'strategy_a', activeCls: 'bg-cyan-300 text-cyan-950',     idleCls: 'bg-cyan-950 text-cyan-300' },
+      strategy_b: { label: 'strategy_b', activeCls: 'bg-violet-300 text-violet-950', idleCls: 'bg-violet-950 text-violet-300' },
+      strategy_c: { label: 'strategy_c', activeCls: 'bg-blue-300 text-blue-950',     idleCls: 'bg-blue-950 text-blue-300' },
+      strategy_d: { label: 'strategy_d', activeCls: 'bg-amber-300 text-amber-950',   idleCls: 'bg-amber-950 text-amber-300' },
+      strategy_e: { label: 'strategy_e', activeCls: 'bg-emerald-300 text-emerald-950', idleCls: 'bg-emerald-950 text-emerald-300' },
+      executor:   { label: 'executor',   activeCls: 'bg-pink-300 text-pink-950',     idleCls: 'bg-pink-950 text-pink-300' },
+      monitor:    { label: 'monitor',    activeCls: 'bg-orange-300 text-orange-950', idleCls: 'bg-orange-950 text-orange-300' },
+      reconciler: { label: 'reconciler', activeCls: 'bg-teal-300 text-teal-950',     idleCls: 'bg-teal-950 text-teal-300' },
+      risk:       { label: 'risk',       activeCls: 'bg-rose-300 text-rose-950',     idleCls: 'bg-rose-950 text-rose-300' },
+      seeder:     { label: 'seeder',     activeCls: 'bg-slate-300 text-slate-900',   idleCls: 'bg-slate-800 text-slate-300' },
+      api:        { label: 'api',        activeCls: 'bg-slate-300 text-slate-900',   idleCls: 'bg-slate-800 text-slate-300' },
+      main:       { label: 'main',       activeCls: 'bg-slate-300 text-slate-900',   idleCls: 'bg-slate-800 text-slate-300' },
+      config:     { label: 'config',     activeCls: 'bg-slate-300 text-slate-900',   idleCls: 'bg-slate-800 text-slate-300' },
+    };
+    const fallbackStyle = { activeCls: 'bg-slate-300 text-slate-900', idleCls: 'bg-slate-800 text-slate-300' };
+    const sourceCls = (src) => (sourceStyles[src] || fallbackStyle).idleCls + ' inline-block';
+    // Source filter pills: only show sources that have actually appeared
+    // in the loaded events, ordered by frequency. Strategy E first when
+    // present so the user can isolate whale snipes at a glance.
+    const eventSources = computed(() => {
+      const counts = {};
+      for (const e of events.value) {
+        counts[e.source] = (counts[e.source] || 0) + 1;
+      }
+      const order = ['strategy_e', 'strategy_d', 'strategy_a', 'strategy_b', 'strategy_c',
+                     'executor', 'monitor', 'reconciler', 'risk', 'seeder', 'api', 'main', 'config'];
+      const seen = new Set();
+      const out = [];
+      for (const k of order) {
+        if (counts[k]) {
+          out.push({ key: k, count: counts[k], ...(sourceStyles[k] || fallbackStyle), label: k });
+          seen.add(k);
+        }
+      }
+      // Append any source we haven't styled.
+      for (const k of Object.keys(counts).sort()) {
+        if (!seen.has(k)) {
+          out.push({ key: k, count: counts[k], ...fallbackStyle, label: k });
+        }
+      }
+      return out;
+    });
+    const filteredEvents = computed(() =>
+      eventFilter.value
+        ? events.value.filter(e => e.source === eventFilter.value)
+        : events.value
+    );
     const openPositions = ref([]);
     const history = reactive({ rows: [], page: 1, total: 0 });
     const historyFilter = reactive({ strategy: '', from: '', to: '' });
@@ -1223,6 +1456,8 @@ createApp({
     let _visNetwork = null;
     const leaders = ref([]);
     const leadersMeta = reactive({});
+    const whales = ref([]);
+    const whalesMeta = reactive({});
     const dStats = reactive({});
     const presetsLive = ref([]);
     const presetsBacktest = ref([]);
@@ -1401,6 +1636,17 @@ createApp({
         const d = await getJson('/api/leaders?trades_per_leader=10');
         leaders.value = d.leaders || [];
         Object.assign(leadersMeta, {
+          refreshed_at: d.refreshed_at,
+          note: d.note,
+        });
+      } catch (e) { /* ignore */ }
+    };
+
+    const loadWhales = async () => {
+      try {
+        const d = await getJson('/api/whales?trades_per_whale=10');
+        whales.value = d.whales || [];
+        Object.assign(whalesMeta, {
           refreshed_at: d.refreshed_at,
           note: d.note,
         });
@@ -1817,6 +2063,7 @@ createApp({
     watch(tab, (t) => {
       if (t === 'graph') setTimeout(loadGraph, 50);
       if (t === 'leaders') loadLeaders();
+      if (t === 'whales' || t === 'strategy e') loadWhales();
       if (t === 'portfolio') loadPortfolio();
       if (t === 'strategy d') loadStrategyDStats();
       if (t === 'config') loadPresets();
@@ -1837,12 +2084,14 @@ createApp({
 
     return {
       tab, tabs, secret, saveSecret, status, pools, stats, config, draft, ledger,
-      events, openPositions, history, historyFilter, withdrawAmount, transferAmount,
+      events, eventFilter, eventSources, filteredEvents, sourceCls,
+      openPositions, history, historyFilter, withdrawAmount, transferAmount,
       diagBusy, exportDiagnostics,
       upcoming, upcomingFilter, loadUpcoming, setPreset,
       wouldBuy, whyNot, matchCount, gainMultClass,
       graphEl, graphFilter, graphMeta, loadGraph,
       leaders, leadersMeta, loadLeaders, fmtAgeDelta,
+      whales, whalesMeta, loadWhales,
       dStats, loadStrategyDStats,
       forceRefreshDLeaders, rosterRefreshMsg,
       portfolio, loadPortfolio, ledgerDelta, reconcileLedger, reconcileBusy,

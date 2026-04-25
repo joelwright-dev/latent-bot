@@ -258,7 +258,7 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_d_category_min_win_rate=_f(values.get("STRATEGY_D_CATEGORY_MIN_WIN_RATE"), 0.40),
         strategy_d_inverse_copy=_b(values.get("STRATEGY_D_INVERSE_COPY"), False),
         strategy_e_enabled=_b(values.get("STRATEGY_E_ENABLED"), True),
-        strategy_e_poll_secs=_i(values.get("STRATEGY_E_POLL_SECS"), 60),
+        strategy_e_poll_secs=_i(values.get("STRATEGY_E_POLL_SECS"), 30),
         strategy_e_num_whales=_i(values.get("STRATEGY_E_NUM_WHALES"), 30),
         strategy_e_leaderboard_window=_s(values.get("STRATEGY_E_LEADERBOARD_WINDOW"), "30d"),
         strategy_e_copy_window_secs=_i(values.get("STRATEGY_E_COPY_WINDOW_SECS"), 600),

@@ -1151,6 +1151,132 @@ def create_app(state: StateManager) -> FastAPI:
         }
 
     # ------------------------------------------------------------------
+    # GET /api/whales — Strategy E whale roster, with recent trades + copy stats
+    # ------------------------------------------------------------------
+    @app.get("/api/whales")
+    async def whales(trades_per_whale: int = Query(10, le=50)) -> dict:
+        """Strategy E whale roster with recent trades + per-whale copy
+        performance. Mirrors /api/leaders but for E. Allowlisted whales
+        appear at the top of the list (window='allowlist')."""
+        import aiohttp, time as _t
+        whales_list = list(state.e_whales)
+        if not whales_list:
+            return {
+                "whales": [],
+                "refreshed_at": state.e_whales_refreshed_at,
+                "note": "Strategy E hasn't run a refresh yet — enable it in config and wait ~1 minute",
+            }
+
+        async def _fetch(session, wallet: str) -> list[dict]:
+            try:
+                async with session.get(
+                    "https://data-api.polymarket.com/activity",
+                    params={"user": wallet,
+                            "limit": str(max(trades_per_whale * 3, 50))},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    if r.status != 200:
+                        return []
+                    data = await r.json()
+                entries = data if isinstance(data, list) else []
+                trades = [e for e in entries if (e.get("type") or "").upper() == "TRADE"]
+                return trades[:trades_per_whale]
+            except Exception:
+                return []
+
+        db = get_db()
+        copied_rows = await db.fetchall(
+            "SELECT market_token_id FROM positions WHERE strategy = 'E'"
+        )
+        copied_tokens = {r["market_token_id"] for r in copied_rows}
+
+        wallets = [w["wallet"] for w in whales_list]
+        whale_stats: dict[str, dict] = {
+            w: {"trades": 0, "wins": 0, "pnl": 0.0, "open": 0} for w in wallets
+        }
+        if wallets:
+            qmarks = ",".join("?" for _ in wallets)
+            rows = await db.fetchall(
+                f"SELECT leader_wallet, status, COALESCE(gain_usdc, 0) AS gain "
+                f"FROM positions "
+                f"WHERE strategy = 'E' AND leader_wallet IN ({qmarks})",
+                tuple(wallets),
+            )
+            for r in rows:
+                w = r["leader_wallet"]
+                if w not in whale_stats:
+                    continue
+                if r["status"] == "settled":
+                    whale_stats[w]["trades"] += 1
+                    whale_stats[w]["pnl"] += float(r["gain"])
+                    if float(r["gain"]) > 0:
+                        whale_stats[w]["wins"] += 1
+                elif r["status"] in ("open", "awaiting_redeem"):
+                    whale_stats[w]["open"] += 1
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [_fetch(session, w["wallet"]) for w in whales_list]
+            trade_lists = await asyncio.gather(*tasks, return_exceptions=True)
+
+        out = []
+        now = int(_t.time())
+        for whale, trades in zip(whales_list, trade_lists):
+            if isinstance(trades, Exception):
+                trades = []
+            enriched = []
+            for t in trades:
+                token = str(t.get("asset") or "")
+                ts = int(t.get("timestamp") or 0)
+                size_usd = None
+                for key in ("size_usd", "usdcSize", "sizeUsd", "usd_size", "notional"):
+                    if t.get(key) is not None:
+                        try:
+                            size_usd = float(t[key])
+                            break
+                        except (TypeError, ValueError):
+                            pass
+                if size_usd is None:
+                    try:
+                        size_usd = float(t.get("size") or 0) * float(t.get("price") or 0)
+                    except (TypeError, ValueError):
+                        size_usd = 0.0
+                enriched.append({
+                    "tx_hash": t.get("transactionHash"),
+                    "token_id": token,
+                    "side": t.get("side"),
+                    "price": t.get("price"),
+                    "size": t.get("size"),
+                    "size_usdc": size_usd,
+                    "timestamp": ts,
+                    "age_secs": max(0, now - ts),
+                    "title": t.get("title"),
+                    "outcome": t.get("outcome"),
+                    "event_slug": t.get("eventSlug"),
+                    "copied_by_us": token in copied_tokens,
+                })
+            ws = whale_stats.get(whale["wallet"], {"trades": 0, "wins": 0, "pnl": 0.0, "open": 0})
+            win_rate = (ws["wins"] / ws["trades"]) if ws["trades"] else None
+            out.append({
+                "wallet": whale["wallet"],
+                "pseudonym": whale["pseudonym"],
+                "pnl_window": whale.get("pnl_window", 0.0),
+                "window": whale.get("window", "30d"),
+                "trades": enriched,
+                "last_trade_age_secs": enriched[0]["age_secs"] if enriched else None,
+                "copy_stats": {
+                    "settled": ws["trades"],
+                    "wins": ws["wins"],
+                    "pnl": round(ws["pnl"], 2),
+                    "win_rate": win_rate,
+                    "open_positions": ws["open"],
+                },
+            })
+        return {
+            "whales": out,
+            "refreshed_at": state.e_whales_refreshed_at,
+        }
+
+    # ------------------------------------------------------------------
     # GET /api/strategy-d-stats — comprehensive analytics for Strategy D
     # ------------------------------------------------------------------
     @app.get("/api/strategy-d-stats")
