@@ -217,7 +217,7 @@ class StrategyE:
                     # Don't even log — would spam during iceberg fills.
                     continue
 
-                copied = await self._consider_copy(
+                await self._consider_copy(
                     cfg, whale, token_id,
                     their_price=grp["latest_price"],
                     their_bet=grp["total_usdc"],
@@ -226,8 +226,12 @@ class StrategyE:
                     trade_ts=grp["latest_ts"],
                     fills=grp["fills"],
                 )
-                if copied:
-                    self._token_cooldown[key] = float(now)
+                # Cooldown set on EVERY evaluation (copy or skip). Without
+                # this, an iceberg of 24 fresh fills logs the same skip
+                # 24 times. If the user fixes the underlying issue (pool
+                # too small etc.) and wants a retry on the same market,
+                # they can shorten STRATEGY_E_PER_TOKEN_COOLDOWN_SECS.
+                self._token_cooldown[key] = float(now)
 
         # Cap memory: never let the seen set grow unbounded.
         if len(self._seen_trade_ids) > 50_000:
@@ -410,6 +414,15 @@ class StrategyE:
             cfg.strategy_e_min_whale_bet_usdc > 0
             and their_bet < cfg.strategy_e_min_whale_bet_usdc
         ):
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (whale bet ${their_bet:.0f} < min "
+                f"${cfg.strategy_e_min_whale_bet_usdc:.0f}) from "
+                f"{whale.pseudonym}: {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "their_bet_usdc": their_bet,
+                 "min_whale_bet": cfg.strategy_e_min_whale_bet_usdc},
+            )
             return False
 
         # --- Price floor ---
@@ -420,6 +433,15 @@ class StrategyE:
         # meaningful slippage above their fill (the slippage cap below
         # protects against chasing).
         if their_price < cfg.strategy_e_min_entry_price:
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (whale@{their_price:.3f} < floor "
+                f"{cfg.strategy_e_min_entry_price:.3f}) from "
+                f"{whale.pseudonym}: {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "their_price": their_price,
+                 "min_entry_price": cfg.strategy_e_min_entry_price},
+            )
             return False
 
         # --- Resolution-imminence gate ---
@@ -451,14 +473,36 @@ class StrategyE:
             # Resolution timestamp passed but the market still trades —
             # extension or stale endDate. Skip rather than buy something
             # whose true resolve time we can't pin down.
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (resolution_ts in the past, market still trading) "
+                f"from {whale.pseudonym}: {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "hours_to_resolve": hours_to_resolve},
+            )
             return False
 
         # --- Live ask check ---
         current_ask = await self._live_best_ask(token_id)
         if current_ask is None:
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (no live ask) from {whale.pseudonym}: "
+                f"{title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id},
+            )
             return False
 
         if current_ask < cfg.strategy_e_min_entry_price:
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (ask {current_ask:.3f} < floor "
+                f"{cfg.strategy_e_min_entry_price:.3f}) from "
+                f"{whale.pseudonym}: {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "current_ask": current_ask,
+                 "min_entry_price": cfg.strategy_e_min_entry_price},
+            )
             return False
 
         # Slippage cap: don't chase if the ask has moved up significantly
@@ -483,7 +527,19 @@ class StrategyE:
             deployable = max(0.0, effective_available - cfg.trading_pool_pause_threshold)
             size = min(desired, deployable)
             if size < cfg.min_order_size:
-                # Pool full — silent skip; would spam during iceberg fills.
+                await self.state.db.log_event(
+                    "info", "strategy_e",
+                    f"skip (pool sizing too small: desired ${desired:.2f}, "
+                    f"size ${size:.2f} < min ${cfg.min_order_size:.2f}; "
+                    f"pool=${pool:.2f}, deployable=${deployable:.2f}, "
+                    f"pause=${cfg.trading_pool_pause_threshold:.2f}) from "
+                    f"{whale.pseudonym}: {title[:60]} [{outcome}]",
+                    {"whale": whale.wallet, "token_id": token_id,
+                     "pool": pool, "desired": desired, "size": size,
+                     "min_order_size": cfg.min_order_size,
+                     "deploy_rate": cfg.strategy_e_deploy_rate,
+                     "pause_threshold": cfg.trading_pool_pause_threshold},
+                )
                 return False
             self._pending_usdc += size
 
