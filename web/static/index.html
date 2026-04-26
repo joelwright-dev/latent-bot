@@ -167,6 +167,12 @@
                 title="Write an adjustment entry to bring the ledger back in line with on-chain cash">
           {{ reconcileBusy ? '…reconciling' : `⚠ reconcile ($${(-ledgerDelta).toFixed(2)})` }}
         </button>
+        <button v-if="ledgerDelta > 0.01"
+                :class="['btn', 'ml-auto', 'btn-pri']"
+                @click="claimSurplus" :disabled="claimBusy"
+                title="Credit the on-chain surplus into the trading pool. Use when wallet has more cash than the ledger — e.g. after an orphaned position resolved or a manual deposit.">
+          {{ claimBusy ? '…claiming' : `+ claim surplus ($${ledgerDelta.toFixed(2)})` }}
+        </button>
       </div>
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
         <div class="card p-4">
@@ -2030,6 +2036,26 @@ createApp({
       }
     };
 
+    const claimBusy = ref(false);
+    const claimSurplus = async () => {
+      if (claimBusy.value) return;
+      if (!confirm(`Credit $${ledgerDelta.value.toFixed(2)} of on-chain surplus into the trading pool? Writes a ledger "adjustment" entry — does NOT move any on-chain funds.`)) return;
+      claimBusy.value = true;
+      try {
+        const r = await postJson('/api/capital/claim-surplus', {});
+        if (r.credited) {
+          alert(`Claimed $${r.surplus_credited.toFixed(2)}. Trading pool now $${r.trading.toFixed(2)}.`);
+        } else {
+          alert(r.note || 'No surplus to claim.');
+        }
+        await Promise.all([refreshAll(), loadPortfolio()]);
+      } catch (e) {
+        alert('Claim failed: ' + e.message);
+      } finally {
+        claimBusy.value = false;
+      }
+    };
+
     const exportDiagnostics = async () => {
       if (diagBusy.value) return;
       diagBusy.value = true;
@@ -2108,6 +2134,7 @@ createApp({
       dStats, loadStrategyDStats,
       forceRefreshDLeaders, rosterRefreshMsg,
       portfolio, loadPortfolio, ledgerDelta, reconcileLedger, reconcileBusy,
+      claimSurplus, claimBusy,
       forceReconcilePositions, reconcilePosBusy,
       fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl,
       loadHistory, saveConfig, toggleStrategy, toggleBot, withdraw, transferGain,

@@ -510,6 +510,68 @@ def create_app(state: StateManager) -> FastAPI:
         }
 
     # ------------------------------------------------------------------
+    # POST /api/capital/claim-surplus
+    # ------------------------------------------------------------------
+    # Inverse of reconcile-to-onchain: when on-chain > ledger, credit
+    # the gap into the trading pool. Use case: a position auto-redeemed
+    # on Polymarket but was never properly recorded in our DB (orphaned
+    # E orders pre-v13, manual deposits, etc.). Real money sitting in
+    # the wallet that the bot can't otherwise see.
+    #
+    # Safety: only credits the actual gap. The ledger never goes higher
+    # than what the wallet truly holds.
+    @app.post("/api/capital/claim-surplus",
+              dependencies=[Depends(require_auth)])
+    async def claim_surplus() -> dict:
+        cfg = get_config()
+        wallet = cfg.polymarket_proxy_address
+        if not wallet:
+            raise HTTPException(400, detail="POLYMARKET_PROXY_ADDRESS not set")
+        if not cfg.polygon_rpc_url:
+            raise HTTPException(400, detail="POLYGON_RPC_URL not set")
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as s:
+            on_chain = await _fetch_usdc_e_balance(s, wallet, cfg.polygon_rpc_url)
+        if on_chain is None:
+            raise HTTPException(502, detail="failed to read on-chain USDC.e")
+
+        trading = await pools.get_trading_balance()
+        gain = await pools.get_gain_balance()
+        surplus = round(on_chain - (trading + gain), 6)
+        if surplus <= 0.000_001:
+            return {
+                "ok": True, "credited": False,
+                "on_chain": on_chain, "trading": trading, "gain": gain,
+                "surplus": surplus,
+                "note": "no surplus to claim — ledger >= on-chain",
+            }
+
+        db = get_db()
+        new_trading = trading + surplus
+        async with db.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO pool_ledger(timestamp, event_type, amount, pool, "
+                "balance_after, position_id, memo) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(time.time()), "adjustment", surplus, "trading",
+                 new_trading, None,
+                 f"claim on-chain surplus (${surplus:.2f})"),
+            )
+
+        new_trading_final = await pools.get_trading_balance()
+        await state.broadcast(Signal(
+            kind=SignalKind.DASHBOARD_REFRESH,
+            payload={"section": "pools"},
+            source="api",
+        ))
+        return {
+            "ok": True, "credited": True,
+            "on_chain": on_chain,
+            "trading": new_trading_final, "gain": gain,
+            "surplus_credited": surplus,
+        }
+
+    # ------------------------------------------------------------------
     # POST /api/strategy/toggle
     # ------------------------------------------------------------------
     @app.post("/api/strategy/toggle", dependencies=[Depends(require_auth)])
