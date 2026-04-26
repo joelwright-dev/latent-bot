@@ -495,13 +495,16 @@ class StrategyE:
         # Beyond that, we treat the market as stale (extension, bug,
         # cancelled) and skip.
         if hours_to_resolve < -cfg.strategy_e_max_hours_past_resolve:
+            our_lag = int(time.time()) - trade_ts
             await self.state.db.log_event(
                 "info", "strategy_e",
                 f"skip (resolved {-hours_to_resolve:.1f}h ago, "
-                f"past stale-cap {cfg.strategy_e_max_hours_past_resolve:.1f}h) "
-                f"from {whale.pseudonym}: {title[:60]} [{outcome}]",
+                f"past stale-cap {cfg.strategy_e_max_hours_past_resolve:.1f}h, "
+                f"our lag {our_lag}s) from {whale.pseudonym}: "
+                f"{title[:60]} [{outcome}]",
                 {"whale": whale.wallet, "token_id": token_id,
-                 "hours_to_resolve": hours_to_resolve},
+                 "hours_to_resolve": hours_to_resolve,
+                 "our_lag_secs": our_lag},
             )
             return False
 
@@ -514,23 +517,27 @@ class StrategyE:
             #   2) Pre-resolution illiquidity: just-listed market, no
             #      makers yet. The whale may have eaten the book or
             #      placed a maker order; copying via taker fails.
-            # Phrase the log accordingly so the user can diagnose.
+            # Surface our lag (whale_fill -> us evaluating) separately
+            # from time-to-resolution, so the user can tell whether
+            # lowering STRATEGY_E_POLL_SECS would have caught this one.
+            our_lag = int(time.time()) - trade_ts
             if hours_to_resolve < 0:
                 reason = (
-                    f"resolved {-hours_to_resolve*60:.0f}m ago, book closed — "
-                    f"lost latency race"
+                    f"resolved {-hours_to_resolve*60:.0f}m ago, our lag {our_lag}s "
+                    f"— lost latency race"
                 )
             else:
                 reason = (
-                    f"{hours_to_resolve*60:.0f}m to resolve, no asks — "
-                    f"market illiquid (whale may have eaten book)"
+                    f"{hours_to_resolve*60:.0f}m to resolve, no asks "
+                    f"(our lag {our_lag}s) — market illiquid"
                 )
             await self.state.db.log_event(
                 "info", "strategy_e",
                 f"skip (no live ask, {reason}) from {whale.pseudonym}: "
                 f"{title[:60]} [{outcome}]",
                 {"whale": whale.wallet, "token_id": token_id,
-                 "hours_to_resolve": hours_to_resolve},
+                 "hours_to_resolve": hours_to_resolve,
+                 "our_lag_secs": our_lag},
             )
             return False
 
