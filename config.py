@@ -149,6 +149,7 @@ class Config:
     reconciler_auto_drift_enabled: bool
     reconciler_drift_min_correct: float    # below this absolute USD, ignore (noise)
     reconciler_drift_max_correct: float    # above this single-cycle USD, log + skip (manual review)
+    reconciler_orphan_grace_hours: float   # don't refund positions younger than this when they're missing from /positions (maker orders rest in the order book and don't appear in /positions until filled)
 
     # Web dashboard
     dashboard_host: str
@@ -300,6 +301,7 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         reconciler_auto_drift_enabled=_b(values.get("RECONCILER_AUTO_DRIFT_ENABLED"), True),
         reconciler_drift_min_correct=_f(values.get("RECONCILER_DRIFT_MIN_CORRECT"), 0.05),
         reconciler_drift_max_correct=_f(values.get("RECONCILER_DRIFT_MAX_CORRECT"), 5.00),
+        reconciler_orphan_grace_hours=_f(values.get("RECONCILER_ORPHAN_GRACE_HOURS"), 6.0),
         dashboard_host=_s(values.get("DASHBOARD_HOST"), "0.0.0.0"),
         dashboard_port=_i(values.get("DASHBOARD_PORT"), 8080),
         dashboard_secret=_s(values.get("DASHBOARD_SECRET"), "changeme"),

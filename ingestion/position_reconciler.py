@@ -282,9 +282,19 @@ class PositionReconciler:
         for row in db_live:
             if row["market_token_id"] in pm_by_token:
                 continue
-            # Vanished from PM → auto-redeemed.
-            await self._settle_from_snapshot(row)
-            settled_auto += 1
+            # Vanished from PM → either auto-redeemed (had cash_pnl) or
+            # never-filled-yet (cash_pnl=None and within grace).
+            # _settle_from_snapshot returns True only when it actually
+            # acted (settled or refunded); the grace-period skip path
+            # leaves the position alone.
+            if row["pm_last_cash_pnl"] is not None:
+                await self._settle_from_snapshot(row)
+                settled_auto += 1
+            else:
+                # Maker still in flight or new taker — _settle_from_snapshot
+                # will silently return without touching it during grace.
+                # Call it anyway in case grace has expired.
+                await self._settle_from_snapshot(row)
 
         if added or settled_auto:
             await db.log_event(
@@ -417,17 +427,33 @@ class PositionReconciler:
 
         if cash_pnl is None:
             # Never synced — position was queued/opened in our DB but
-            # never appeared on Polymarket. Most likely the CLOB order
-            # didn't actually fill (race condition, insufficient funds,
-            # post-post rejection). Cancel the position and refund the
-            # principal to the trading pool.
+            # never appeared on Polymarket /positions. This used to be
+            # treated as immediate failure, but maker orders rest in
+            # the CLOB order book until filled and DON'T appear in
+            # /positions until they actually take shares. Killing them
+            # at first cycle (3 min) was destroying every E maker bid
+            # before any seller could hit it.
+            #
+            # Honour a grace period long enough for the executor's own
+            # _watch_fill timeout to handle cancellation. After that,
+            # if a position is still 'open' and never on PM, it really
+            # is orphaned (executor died, CLOB rejected without us
+            # seeing it, etc.) and we refund.
+            opened_at = int(row["opened_at"])
+            age_hours = (int(time.time()) - opened_at) / 3600.0
+            grace = get_config().reconciler_orphan_grace_hours
+            if age_hours < grace:
+                # Maker order still in flight, or fresh taker. Skip.
+                return
+
             from capital.pools import refund_trade
             await db.log_event(
                 "warn", "reconciler",
-                f"position {pos_id} never appeared on Polymarket — "
+                f"position {pos_id} never appeared on Polymarket "
+                f"after {age_hours:.1f}h (grace {grace:.1f}h) — "
                 f"treating as failed and refunding ${principal:.2f} to pool",
                 {"position_id": pos_id, "principal": principal,
-                 "strategy": strategy},
+                 "strategy": strategy, "age_hours": age_hours},
             )
             await db.execute(
                 "UPDATE positions SET status = 'failed', "
