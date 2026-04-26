@@ -922,6 +922,7 @@
                 'bg-violet-900 text-violet-200': p.strategy === 'B',
                 'bg-teal-900 text-teal-200':   p.strategy === 'C',
                 'bg-amber-900 text-amber-200': p.strategy === 'D',
+                'bg-emerald-900 text-emerald-200': p.strategy === 'E',
                 'bg-slate-800 text-slate-300': p.strategy === 'M',
               }">{{ p.strategy }}</span>
             </td>
@@ -940,16 +941,27 @@
               <span v-else>—</span>
             </td>
             <td class="text-right num">${{ fmt(p.size_usdc) }}</td>
-            <td class="text-right num">{{ fmt(p.shares, 2) }}</td>
+            <td class="text-right num">
+              <span v-if="p.fill_state === 'resting' || p.fill_state === 'pending'" class="text-slate-600" title="Bid resting in CLOB book — no shares held yet">—</span>
+              <span v-else>{{ fmt(p.shares, 2) }}</span>
+            </td>
             <td class="num">{{ fmtAge(p.opened_at) }}</td>
-            <td class="text-right num" :class="estPnl(p) >= 0 ? 'text-emerald-400' : 'text-rose-400'">
-              {{ estPnl(p) >= 0 ? '+' : '' }}${{ fmt(estPnl(p)) }}
+            <td class="text-right num" :class="(p.fill_state === 'resting' || p.fill_state === 'pending') ? 'text-slate-600' : (estPnl(p) >= 0 ? 'text-emerald-400' : 'text-rose-400')">
+              <span v-if="p.fill_state === 'resting' || p.fill_state === 'pending'" title="No P&L until the bid fills">—</span>
+              <span v-else>{{ estPnl(p) >= 0 ? '+' : '' }}${{ fmt(estPnl(p)) }}</span>
             </td>
             <td>
               <span class="pill" :class="{
-                'bg-slate-800 text-slate-300': p.status === 'open',
-                'bg-amber-800 text-amber-200': p.status === 'awaiting_redeem',
-              }">{{ p.status }}</span>
+                'bg-emerald-900 text-emerald-200': p.fill_state === 'filled',
+                'bg-indigo-900 text-indigo-200': p.fill_state === 'resting',
+                'bg-slate-800 text-slate-400': p.fill_state === 'pending',
+                'bg-amber-800 text-amber-200': p.fill_state === 'awaiting_redeem',
+              }" :title="p.fill_state === 'resting' ? 'Maker bid in CLOB book waiting for a seller. No shares held; capital reserved on-chain by Polymarket.' : (p.fill_state === 'pending' ? 'Just placed; waiting for first reconciler sync to confirm fill state.' : '')">
+                {{ p.fill_state === 'resting' ? 'resting bid'
+                  : p.fill_state === 'pending' ? 'pending'
+                  : p.fill_state === 'filled' ? 'filled'
+                  : p.fill_state }}
+              </span>
             </td>
           </tr>
           <tr v-if="openPositions.length === 0"><td colspan="11" class="text-center text-slate-500 py-8">No open positions.</td></tr>

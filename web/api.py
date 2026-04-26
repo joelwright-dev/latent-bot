@@ -172,6 +172,7 @@ def create_app(state: StateManager) -> FastAPI:
                 (limit,),
             )
         out = []
+        now = int(time.time())
         for r in rows:
             d = _row_to_dict(r)
             # Hide resolved-loser positions whose Polymarket snapshot
@@ -181,6 +182,26 @@ def create_app(state: StateManager) -> FastAPI:
             pm_value = d.get("pm_last_value")
             if pm_value is not None and float(pm_value) < 0.01 and d.get("pm_last_redeemable"):
                 continue
+
+            # fill_state distinguishes "resting bid" (maker order in the
+            # CLOB book, no shares held) from "filled" (Polymarket sees
+            # us as holding shares). For the user this matters: a row
+            # that says "open" might mean either, and the est. P&L on a
+            # resting bid is meaningless.
+            opened_at = int(d.get("opened_at") or 0)
+            age_secs = now - opened_at
+            sync_at = d.get("pm_last_sync_at")
+            if d.get("status") in ("open", "awaiting_redeem"):
+                if sync_at:
+                    d["fill_state"] = "filled"
+                elif age_secs < 240:
+                    # Within 4 min, reconciler may not have run yet.
+                    d["fill_state"] = "pending"
+                else:
+                    d["fill_state"] = "resting"  # bid in book, no fill
+            else:
+                d["fill_state"] = d.get("status")
+
             # Derived fields for the monitor view.
             entry = float(d.get("entry_price") or 0)
             peak = float(d.get("peak_price") or 0) or entry
