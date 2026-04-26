@@ -539,36 +539,52 @@ class StrategyE:
             )
             return False
 
-        # --- Live ask check ---
-        current_ask = await self._live_best_ask(token_id)
+        # --- Live book check ---
+        # We need an ask to take (we're a taker, not a maker). Three
+        # cases produce no ask, with very different meanings — the log
+        # distinguishes them so the user knows whether the bot can act.
+        book = await self._live_book_summary(token_id)
+        current_ask = book["best_ask"]
         if current_ask is None:
-            # Empty book has two distinct causes:
-            #   1) Past resolution: book closed ~30s after endDate.
-            #      We lost the latency race.
-            #   2) Pre-resolution illiquidity: just-listed market, no
-            #      makers yet. The whale may have eaten the book or
-            #      placed a maker order; copying via taker fails.
-            # Surface our lag (whale_fill -> us evaluating) separately
-            # from time-to-resolution, so the user can tell whether
-            # lowering STRATEGY_E_POLL_SECS would have caught this one.
             our_lag = int(time.time()) - trade_ts
-            if hours_to_resolve < 0:
+            best_bid = book["best_bid"]
+            n_asks = book["n_asks"]
+            n_bids = book["n_bids"]
+
+            if book["error"]:
+                reason = f"CLOB read error: {book['error']}"
+            elif n_bids > 0 and n_asks == 0:
+                # Whale is providing liquidity — placing bids that
+                # sellers hit. Their "BUY" trades are passive fills.
+                # We can't follow as a taker; would need to place a
+                # competing maker bid (different strategy).
                 reason = (
-                    f"resolved {-hours_to_resolve*60:.0f}m ago, our lag {our_lag}s "
-                    f"— lost latency race"
+                    f"whale acting as MAKER ({n_bids} bids "
+                    f"top@{best_bid:.3f}, 0 asks) — can't follow as taker"
                 )
+            elif n_bids == 0 and n_asks == 0:
+                if hours_to_resolve < 0:
+                    reason = (
+                        f"book empty, resolved {-hours_to_resolve*60:.0f}m ago — "
+                        f"market closed for orders"
+                    )
+                else:
+                    reason = (
+                        f"book empty, {hours_to_resolve*60:.0f}m to resolve — "
+                        f"genuinely illiquid"
+                    )
             else:
-                reason = (
-                    f"{hours_to_resolve*60:.0f}m to resolve, no asks "
-                    f"(our lag {our_lag}s) — market illiquid"
-                )
+                reason = f"no asks ({n_bids} bids exist)"
+
             await self.state.db.log_event(
                 "info", "strategy_e",
-                f"skip (no live ask, {reason}) from {whale.pseudonym}: "
-                f"{title[:60]} [{outcome}]",
+                f"skip ({reason}, our lag {our_lag}s) from "
+                f"{whale.pseudonym}: {title[:60]} [{outcome}]",
                 {"whale": whale.wallet, "token_id": token_id,
                  "hours_to_resolve": hours_to_resolve,
-                 "our_lag_secs": our_lag},
+                 "our_lag_secs": our_lag,
+                 "n_asks": n_asks, "n_bids": n_bids,
+                 "best_bid": best_bid, "error": book["error"]},
             )
             return False
 
@@ -736,19 +752,55 @@ class StrategyE:
         )
         return _parse_iso_ts(end_str)
 
-    async def _live_best_ask(self, token_id: str) -> Optional[float]:
+    async def _live_book_summary(self, token_id: str) -> dict:
+        """Read the CLOB order book and return a structured summary.
+
+        Returns a dict with:
+          best_ask:  float | None  — lowest sell price, or None if no asks
+          best_bid:  float | None  — highest buy price,  or None if no bids
+          n_asks:    int           — number of distinct ask levels
+          n_bids:    int           — number of distinct bid levels
+          error:     str  | None   — non-None if the API call failed
+
+        Three distinct "no ask" cases the caller may want to distinguish:
+          1. error != None         → API problem; retry next tick
+          2. n_asks == 0 and n_bids == 0 → book entirely empty (closed)
+          3. n_asks == 0 and n_bids >  0 → whale acting as maker; asks
+             have been cleared and only bids remain. Nothing to take.
+        """
+        out = {"best_ask": None, "best_bid": None,
+               "n_asks": 0, "n_bids": 0, "error": None}
         if self._clob is None:
-            return None
+            out["error"] = "no_clob_client"
+            return out
         try:
             book = await asyncio.to_thread(self._clob.get_order_book, token_id)
         except Exception as e:
-            log.debug("live book fetch failed for %s: %s", token_id, e)
-            return None
-        asks = getattr(book, "asks", None) or (
-            book.get("asks") if isinstance(book, dict) else None
-        ) or []
-        if not asks:
-            return None
+            out["error"] = str(e)[:80]
+            return out
+
+        def _side(name: str) -> list:
+            v = getattr(book, name, None)
+            if v is None and isinstance(book, dict):
+                v = book.get(name)
+            return v or []
+
         def _price(e) -> float:
-            return float(getattr(e, "price", None) or e["price"])
-        return min(_price(a) for a in asks)
+            p = getattr(e, "price", None)
+            if p is None and isinstance(e, dict):
+                p = e.get("price")
+            return float(p) if p is not None else 0.0
+
+        asks = _side("asks")
+        bids = _side("bids")
+        out["n_asks"] = len(asks)
+        out["n_bids"] = len(bids)
+        if asks:
+            out["best_ask"] = min(_price(a) for a in asks if _price(a) > 0)
+        if bids:
+            out["best_bid"] = max(_price(b) for b in bids if _price(b) > 0)
+        return out
+
+    async def _live_best_ask(self, token_id: str) -> Optional[float]:
+        """Backwards-compat shim: just the best ask price."""
+        return (await self._live_book_summary(token_id))["best_ask"]
