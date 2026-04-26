@@ -187,8 +187,11 @@ class Executor:
             source="executor",
         ))
 
-        # 3. Watch for fill.
-        asyncio.create_task(self._watch_fill(position_id, order_id))
+        # 3. Watch for fill. Maker orders (Strategy E maker mode) wait
+        # much longer than the default 15 min — they're passive bids
+        # waiting for a counterparty.
+        timeout = req.fill_timeout_secs if req.fill_timeout_secs else FILL_TIMEOUT_SECS
+        asyncio.create_task(self._watch_fill(position_id, order_id, timeout))
 
     async def _ensure_market_stub(self, token_id: str) -> None:
         """Guarantee a row exists in markets for this token so the
@@ -234,13 +237,16 @@ class Executor:
         signed = self.client().create_order(args)
         return self.client().post_order(signed, OrderType.GTC)
 
-    async def _watch_fill(self, position_id: int, order_id: Optional[str]) -> None:
+    async def _watch_fill(
+        self, position_id: int, order_id: Optional[str],
+        timeout_secs: int = FILL_TIMEOUT_SECS,
+    ) -> None:
         """Poll order status until filled, cancelled, or timeout."""
         if not order_id:
             return
         db = self.state.db
         start = time.time()
-        while time.time() - start < FILL_TIMEOUT_SECS:
+        while time.time() - start < timeout_secs:
             await asyncio.sleep(FILL_POLL_SECS)
             try:
                 status = await asyncio.to_thread(self.client().get_order, order_id)

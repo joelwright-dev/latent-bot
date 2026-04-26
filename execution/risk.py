@@ -54,6 +54,10 @@ class OrderRequest:
     time_in_force: str = "GTC"
     memo: Optional[str] = None
     leader_wallet: Optional[str] = None   # Strategy D: the leader being copied
+    # Per-order fill timeout. None = use executor's default (15 min).
+    # Strategy E maker orders need longer windows since they wait
+    # passively for a counterparty rather than crossing the spread.
+    fill_timeout_secs: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------

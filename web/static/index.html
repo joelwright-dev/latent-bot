@@ -1273,6 +1273,15 @@
           <label class="block text-sm" title="If ask moved up by more than this since whale fill, skip — we'd be chasing.">Max slippage abs ($)
             <input class="input w-full mt-1" type="number" step="0.005" v-model.number="draft.strategy_e_max_price_slippage_abs" />
           </label>
+          <label class="flex items-center gap-2 text-sm" title="When whales clear the ask side and place passive bids (acting as makers), join their side with our own resting bid. Slow but identical upside — fills only when a seller hits us.">
+            <input type="checkbox" v-model="draft.strategy_e_maker_enabled" /> Maker mode (place bids when no asks)
+          </label>
+          <label class="block text-sm" title="Offset above the whale's bid price. 0 = match exactly (lower fill rate, behind whale in time priority); 0.001 = jump them by 1 tick (better priority, marginally less upside).">Maker price offset ($)
+            <input class="input w-full mt-1" type="number" step="0.001" v-model.number="draft.strategy_e_maker_price_offset" />
+          </label>
+          <label class="block text-sm" title="Cancel resting maker bid if unfilled after this long. Auto-capped to time-to-resolve so we don't sit on a bid past market close.">Maker timeout (hours)
+            <input class="input w-full mt-1" type="number" step="0.5" v-model.number="draft.strategy_e_maker_timeout_hours" />
+          </label>
           <label class="block text-sm">Copy window (secs)
             <input class="input w-full mt-1" type="number" v-model.number="draft.strategy_e_copy_window_secs" />
           </label>

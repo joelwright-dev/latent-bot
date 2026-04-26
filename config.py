@@ -117,6 +117,12 @@ class Config:
     strategy_e_min_whale_bet_usdc: float        # only follow whale trades >= this size (0 = disable)
     strategy_e_max_price_slippage_abs: float    # don't chase if ask moved up by more than $X since whale fill
     strategy_e_whale_allowlist: str             # comma-separated wallets always tracked (in addition to leaderboard cohort)
+    # Maker mode: when whales place passive bids (book has bids but no
+    # asks), join their side with our own resting bid. Fills only when a
+    # seller hits us — slow but the upside math is identical to taker.
+    strategy_e_maker_enabled: bool
+    strategy_e_maker_price_offset: float        # 0 = match whale's bid; 0.001 = jump them by 1 tick
+    strategy_e_maker_timeout_hours: float       # cancel resting maker bid if unfilled after N hours
 
     # PositionMonitor (auto-exit logic for Strategy D copy trades)
     monitor_enabled: bool
@@ -271,6 +277,9 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_e_deploy_rate=_f(values.get("STRATEGY_E_DEPLOY_RATE"), 0.10),
         strategy_e_min_whale_bet_usdc=_f(values.get("STRATEGY_E_MIN_WHALE_BET_USDC"), 0.0),
         strategy_e_max_price_slippage_abs=_f(values.get("STRATEGY_E_MAX_PRICE_SLIPPAGE_ABS"), 0.02),
+        strategy_e_maker_enabled=_b(values.get("STRATEGY_E_MAKER_ENABLED"), True),
+        strategy_e_maker_price_offset=_f(values.get("STRATEGY_E_MAKER_PRICE_OFFSET"), 0.0),
+        strategy_e_maker_timeout_hours=_f(values.get("STRATEGY_E_MAKER_TIMEOUT_HOURS"), 4.0),
         strategy_e_whale_allowlist=_s(
             values.get("STRATEGY_E_WHALE_ALLOWLIST"),
             "0x9b979a065641e8cfde3022a30ed2d9415cf55e12,"

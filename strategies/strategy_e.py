@@ -540,78 +540,107 @@ class StrategyE:
             return False
 
         # --- Live book check ---
-        # We need an ask to take (we're a taker, not a maker). Three
-        # cases produce no ask, with very different meanings — the log
-        # distinguishes them so the user knows whether the bot can act.
+        # Two paths: TAKER (cross the spread, hit an ask) or MAKER (rest
+        # a bid, wait for a seller). We prefer taker when an ask exists
+        # within slippage; fall back to maker when whales have cleared
+        # the ask side and are absorbing seller flow at a stable bid.
         book = await self._live_book_summary(token_id)
         current_ask = book["best_ask"]
-        if current_ask is None:
-            our_lag = int(time.time()) - trade_ts
-            best_bid = book["best_bid"]
-            n_asks = book["n_asks"]
-            n_bids = book["n_bids"]
+        best_bid = book["best_bid"]
+        n_asks = book["n_asks"]
+        n_bids = book["n_bids"]
+        is_maker_order = False
+        our_price: Optional[float] = None
 
-            if book["error"]:
-                reason = f"CLOB read error: {book['error']}"
-            elif n_bids > 0 and n_asks == 0:
-                # Whale is providing liquidity — placing bids that
-                # sellers hit. Their "BUY" trades are passive fills.
-                # We can't follow as a taker; would need to place a
-                # competing maker bid (different strategy).
-                reason = (
-                    f"whale acting as MAKER ({n_bids} bids "
-                    f"top@{best_bid:.3f}, 0 asks) — can't follow as taker"
+        if current_ask is not None:
+            # Taker path: live ask exists.
+            if current_ask < cfg.strategy_e_min_entry_price:
+                await self.state.db.log_event(
+                    "info", "strategy_e",
+                    f"skip (ask {current_ask:.3f} < floor "
+                    f"{cfg.strategy_e_min_entry_price:.3f}) from "
+                    f"{whale.pseudonym}: {title[:60]} [{outcome}]",
+                    {"whale": whale.wallet, "token_id": token_id,
+                     "current_ask": current_ask,
+                     "min_entry_price": cfg.strategy_e_min_entry_price},
                 )
-            elif n_bids == 0 and n_asks == 0:
-                if hours_to_resolve < 0:
-                    reason = (
-                        f"book empty, resolved {-hours_to_resolve*60:.0f}m ago — "
-                        f"market closed for orders"
+                return False
+            slip_cap = their_price + cfg.strategy_e_max_price_slippage_abs
+            if current_ask > slip_cap:
+                await self.state.db.log_event(
+                    "info", "strategy_e",
+                    f"skip slippage: whale@{their_price:.3f} now "
+                    f"{current_ask:.3f} (cap {slip_cap:.3f}): "
+                    f"{title[:60]} [{outcome}]",
+                    {"whale": whale.wallet, "token_id": token_id,
+                     "their_price": their_price, "current_ask": current_ask},
+                )
+                return False
+            our_price = current_ask
+        else:
+            # No ask — maker path or honest skip, depending on book state.
+            our_lag = int(time.time()) - trade_ts
+            if book["error"]:
+                await self.state.db.log_event(
+                    "info", "strategy_e",
+                    f"skip (CLOB read error: {book['error']}, our lag "
+                    f"{our_lag}s) from {whale.pseudonym}: "
+                    f"{title[:60]} [{outcome}]",
+                    {"whale": whale.wallet, "token_id": token_id,
+                     "error": book["error"]},
+                )
+                return False
+            if n_bids > 0 and n_asks == 0 and cfg.strategy_e_maker_enabled:
+                # Maker-mode: whale is providing liquidity. Join their
+                # side at their price (or a tick above if configured).
+                # If a seller hits us, we get the position. If not,
+                # the order auto-cancels after maker_timeout_hours.
+                if best_bid < cfg.strategy_e_min_entry_price:
+                    await self.state.db.log_event(
+                        "info", "strategy_e",
+                        f"skip maker (top bid {best_bid:.3f} < floor "
+                        f"{cfg.strategy_e_min_entry_price:.3f}) from "
+                        f"{whale.pseudonym}: {title[:60]} [{outcome}]",
+                        {"whale": whale.wallet, "token_id": token_id,
+                         "best_bid": best_bid},
                     )
+                    return False
+                # Round to 3 decimals — Polymarket tick size is 0.001.
+                our_price = round(
+                    best_bid + cfg.strategy_e_maker_price_offset, 3,
+                )
+                # Don't bid above 1.0 (or above max sensible price).
+                our_price = min(our_price, 0.999)
+                is_maker_order = True
+            else:
+                # Genuine no-ask case: closed market or all-empty book.
+                if n_bids == 0 and n_asks == 0:
+                    if hours_to_resolve < 0:
+                        reason = (
+                            f"book empty, resolved {-hours_to_resolve*60:.0f}m "
+                            f"ago — market closed for orders"
+                        )
+                    else:
+                        reason = (
+                            f"book empty, {hours_to_resolve*60:.0f}m to "
+                            f"resolve — genuinely illiquid"
+                        )
                 else:
                     reason = (
-                        f"book empty, {hours_to_resolve*60:.0f}m to resolve — "
-                        f"genuinely illiquid"
+                        f"asks=0 bids={n_bids} top@{best_bid:.3f} but maker "
+                        f"mode disabled"
                     )
-            else:
-                reason = f"no asks ({n_bids} bids exist)"
-
-            await self.state.db.log_event(
-                "info", "strategy_e",
-                f"skip ({reason}, our lag {our_lag}s) from "
-                f"{whale.pseudonym}: {title[:60]} [{outcome}]",
-                {"whale": whale.wallet, "token_id": token_id,
-                 "hours_to_resolve": hours_to_resolve,
-                 "our_lag_secs": our_lag,
-                 "n_asks": n_asks, "n_bids": n_bids,
-                 "best_bid": best_bid, "error": book["error"]},
-            )
-            return False
-
-        if current_ask < cfg.strategy_e_min_entry_price:
-            await self.state.db.log_event(
-                "info", "strategy_e",
-                f"skip (ask {current_ask:.3f} < floor "
-                f"{cfg.strategy_e_min_entry_price:.3f}) from "
-                f"{whale.pseudonym}: {title[:60]} [{outcome}]",
-                {"whale": whale.wallet, "token_id": token_id,
-                 "current_ask": current_ask,
-                 "min_entry_price": cfg.strategy_e_min_entry_price},
-            )
-            return False
-
-        # Slippage cap: don't chase if the ask has moved up significantly
-        # since the whale filled. At these prices a 2¢ move is meaningful.
-        slip_cap = their_price + cfg.strategy_e_max_price_slippage_abs
-        if current_ask > slip_cap:
-            await self.state.db.log_event(
-                "info", "strategy_e",
-                f"skip slippage: whale@{their_price:.3f} now {current_ask:.3f} "
-                f"(cap {slip_cap:.3f}): {title[:60]} [{outcome}]",
-                {"whale": whale.wallet, "token_id": token_id,
-                 "their_price": their_price, "current_ask": current_ask},
-            )
-            return False
+                await self.state.db.log_event(
+                    "info", "strategy_e",
+                    f"skip ({reason}, our lag {our_lag}s) from "
+                    f"{whale.pseudonym}: {title[:60]} [{outcome}]",
+                    {"whale": whale.wallet, "token_id": token_id,
+                     "hours_to_resolve": hours_to_resolve,
+                     "our_lag_secs": our_lag,
+                     "n_asks": n_asks, "n_bids": n_bids,
+                     "best_bid": best_bid},
+                )
+                return False
 
         # --- Sizing ---
         async with self._pending_lock:
@@ -638,17 +667,33 @@ class StrategyE:
                 return False
             self._pending_usdc += size
 
+        action = "BID" if is_maker_order else "SNIPE"
+        # Maker orders need a long timeout — the bid rests until a
+        # seller hits us. If neither happens by maker_timeout, cancel
+        # and refund. Cap at hours_to_resolve so we don't sit on a
+        # bid past the market's nominal end.
+        if is_maker_order:
+            maker_timeout = int(
+                min(
+                    cfg.strategy_e_maker_timeout_hours * 3600,
+                    max(60, hours_to_resolve * 3600) if hours_to_resolve > 0 else 4 * 3600,
+                )
+            )
+        else:
+            maker_timeout = None
         req = OrderRequest(
             strategy="E",
             token_id=token_id,
             side="BUY",
-            limit_price=round(current_ask, 4),
+            limit_price=round(our_price, 4),
             size_usdc=round(size, 2),
             memo=(
-                f"strategy_e snipe {whale.pseudonym[:16]}@{their_price:.3f} "
-                f"({outcome}, ~{hours_to_resolve:.1f}h to resolve)"
+                f"strategy_e {action.lower()} {whale.pseudonym[:16]}@"
+                f"{their_price:.3f} ({outcome}, "
+                f"~{hours_to_resolve:.1f}h to resolve)"
             ),
             leader_wallet=whale.wallet,
+            fill_timeout_secs=maker_timeout,
         )
         lag_secs = int(time.time()) - trade_ts
         fills_str = f", {fills} fills" if fills > 1 else ""
@@ -660,13 +705,13 @@ class StrategyE:
         )
         await self.state.db.log_event(
             "info", "strategy_e",
-            f"SNIPE {whale.pseudonym}: BUY ${size:.2f}@{current_ask:.4f} "
+            f"{action} {whale.pseudonym}: BUY ${size:.2f}@{our_price:.4f} "
             f"({outcome}, whale@{their_price:.3f} bet ${their_bet:.0f}{fills_str}, "
             f"{when_str}, {lag_secs}s lag): {title[:60]}",
             {"whale_wallet": whale.wallet, "whale_pseudonym": whale.pseudonym,
              "token_id": token_id, "their_price": their_price,
              "their_bet_usdc": their_bet, "fills": fills,
-             "our_price": current_ask,
+             "our_price": our_price, "is_maker": is_maker_order,
              "size": size, "lag_secs": lag_secs,
              "hours_to_resolve": hours_to_resolve,
              "title": title, "outcome": outcome},
