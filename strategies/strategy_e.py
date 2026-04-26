@@ -110,12 +110,12 @@ class StrategyE:
         self._pending_hold_secs = 5.0
         # token_id → (resolution_ts_or_None, fetched_at). None = unknown.
         self._end_ts_cache: dict[str, tuple[Optional[int], float]] = {}
-        # (whale, token_id) → last_copy_ts. Iceberg dedup: these whales
-        # split a single buy across 20+ fills to hide size; without
-        # this cache we'd copy each fill and drain the pool on one
-        # market. After we copy once, ignore further fills from the
-        # same whale on the same token for STRATEGY_E_PER_TOKEN_COOLDOWN.
-        self._token_cooldown: dict[tuple[str, str], float] = {}
+        # token_id → emit_ts. Bridges the race window between us emitting
+        # an OrderRequest and the position row landing in the DB. Once
+        # the position is in the DB, the SQL dedup check takes over and
+        # this entry can expire. ~30s is a generous upper bound on
+        # executor latency.
+        self._pending_tokens: dict[str, float] = {}
 
     async def run(self) -> None:
         self._running = True
@@ -157,9 +157,10 @@ class StrategyE:
         now = int(time.time())
         window_cutoff = now - cfg.strategy_e_copy_window_secs
 
-        # GC expired cooldowns. Values are absolute expiry timestamps.
-        self._token_cooldown = {
-            k: v for k, v in self._token_cooldown.items() if v > now
+        # Drop pending-emit entries older than 30s — by then the position
+        # row should have landed in the DB and the SQL dedup takes over.
+        self._pending_tokens = {
+            tok: t for tok, t in self._pending_tokens.items() if (now - t) < 30
         }
 
         results = await asyncio.gather(
@@ -209,12 +210,12 @@ class StrategyE:
                     grp["latest_price"] = their_price
 
             for token_id, grp in buys_by_token.items():
-                key = (whale.wallet.lower(), token_id)
-                if self._token_cooldown.get(key, 0) > now:
-                    # Cooldown still active — silent skip to avoid spam.
-                    continue
-
-                copied = await self._consider_copy(
+                # Iceberg dedup happens via two real-state checks inside
+                # _consider_copy: (1) is there an open E position on this
+                # token? (2) did we emit an order for this token in the
+                # last few seconds? Both are observable, no time-based
+                # cooldown that could swallow legitimate later signals.
+                await self._consider_copy(
                     cfg, whale, token_id,
                     their_price=grp["latest_price"],
                     their_bet=grp["total_usdc"],
@@ -223,18 +224,6 @@ class StrategyE:
                     trade_ts=grp["latest_ts"],
                     fills=grp["fills"],
                 )
-                # Two-tier cooldown:
-                #   COPY  -> long (per_token_cooldown_secs, default 1h):
-                #            we already have a position, ignore further
-                #            iceberg fills entirely.
-                #   SKIP  -> short (skip_cooldown_secs, default 60s):
-                #            just enough to dedup an iceberg burst, but
-                #            not so long that a later fill (which sees
-                #            different market state) gets swallowed.
-                if copied:
-                    self._token_cooldown[key] = now + cfg.strategy_e_per_token_cooldown_secs
-                else:
-                    self._token_cooldown[key] = now + cfg.strategy_e_skip_cooldown_secs
 
         # Cap memory: never let the seen set grow unbounded.
         if len(self._seen_trade_ids) > 50_000:
@@ -408,6 +397,38 @@ class StrategyE:
         their_bet: float, title: str, outcome: str, trade_ts: int,
         fills: int = 1,
     ) -> bool:
+        # --- Position dedup ---
+        # Mirror the whale once per market, not once per fill. Whales
+        # iceberg-split a single conviction buy into many fills over
+        # minutes; we only want one position. Two checks:
+        #   1) Open/awaiting-redeem E position on this token already?
+        #   2) Did we emit an order for this token in the last ~30s
+        #      (the executor hasn't yet INSERTed the position row)?
+        existing = await self.state.db.fetchval(
+            "SELECT id FROM positions "
+            "WHERE strategy = 'E' AND market_token_id = ? "
+            "  AND status IN ('open', 'awaiting_redeem')",
+            (token_id,),
+        )
+        if existing:
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (already have open E position #{existing}) from "
+                f"{whale.pseudonym}: {title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id,
+                 "existing_position_id": existing},
+            )
+            return False
+        if (time.time() - self._pending_tokens.get(token_id, 0.0)) < 30:
+            await self.state.db.log_event(
+                "info", "strategy_e",
+                f"skip (order just emitted for this market, awaiting "
+                f"position row) from {whale.pseudonym}: "
+                f"{title[:60]} [{outcome}]",
+                {"whale": whale.wallet, "token_id": token_id},
+            )
+            return False
+
         # --- Whale conviction gate ---
         # A whale dropping a token-amount trade with no real money behind
         # it is just paying attention. The grinders we want often bet
@@ -642,6 +663,8 @@ class StrategyE:
                 source="strategy_e",
             ),
         )
+        # Bridge the race between emit and the position row landing.
+        self._pending_tokens[token_id] = time.time()
         asyncio.create_task(self._release_slot(size))
         return True
 

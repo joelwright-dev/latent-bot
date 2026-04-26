@@ -1267,9 +1267,6 @@
           <label class="block text-sm" title="Filter tiny tracking bets. Set 0 to follow every whale BUY regardless of size. Allowlisted whales often scale in via tiny iceberg fills, so 0 is the default.">Min whale bet (USDC, 0 = off)
             <input class="input w-full mt-1" type="number" step="5" v-model.number="draft.strategy_e_min_whale_bet_usdc" />
           </label>
-          <label class="block text-sm" title="Iceberg dedup: after we copy once on (whale, market), ignore further fills from that whale on that market for N seconds. Allowlisted whales often split one conviction buy across 20+ fills.">Per-token cooldown (secs)
-            <input class="input w-full mt-1" type="number" step="60" v-model.number="draft.strategy_e_per_token_cooldown_secs" />
-          </label>
           <label class="block text-sm" title="Wallets always tracked, in addition to the leaderboard cohort. Comma-separated, any case. Use this for high-win-rate grinders who never make the top-30 USD list.">Whale allowlist (comma-separated)
             <input class="input w-full mt-1" type="text" v-model="draft.strategy_e_whale_allowlist" placeholder="0xabc..,0xdef.." />
           </label>
