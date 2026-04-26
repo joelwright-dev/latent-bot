@@ -592,18 +592,32 @@ class StrategyD:
             deployable = max(0.0, effective_available - cfg.trading_pool_pause_threshold)
             size = min(desired, deployable)
 
-            if size < cfg.min_order_size:
+            # Polymarket CLOB rejects orders smaller than 5 shares per
+            # side. At higher prices that means a higher USDC floor
+            # than min_order_size. Bump up if pool can fund it.
+            CLOB_MIN_SHARES = 5
+            min_usdc_for_clob = CLOB_MIN_SHARES * current_ask
+            required_min = max(cfg.min_order_size, min_usdc_for_clob)
+            if size < required_min and deployable >= required_min:
+                size = min(required_min, cfg.strategy_d_max_position, deployable)
+
+            if size < required_min:
                 await self.state.db.log_event(
                     "info", "strategy_d",
-                    f"skip (pool full: size ${size:.2f} < min ${cfg.min_order_size:.2f}; "
-                    f"effective_avail=${effective_available:.2f}, "
-                    f"locked=${locked:.2f}, pending=${self._pending_usdc:.2f}) "
-                    f"from {leader.pseudonym}: {title[:60]} [{outcome}]",
+                    f"skip (sizing: size ${size:.2f} < required "
+                    f"${required_min:.2f} [usdc_min ${cfg.min_order_size:.2f}, "
+                    f"clob_min {CLOB_MIN_SHARES}×${current_ask:.3f}="
+                    f"${min_usdc_for_clob:.2f}]; effective_avail="
+                    f"${effective_available:.2f}, locked=${locked:.2f}, "
+                    f"pending=${self._pending_usdc:.2f}) from "
+                    f"{leader.pseudonym}: {title[:60]} [{outcome}]",
                     {"leader": leader.wallet, "token_id": token_id,
                      "pool": pool, "locked": locked,
                      "pending_usdc": self._pending_usdc,
                      "effective_available": effective_available,
                      "desired": desired, "actual_size": size,
+                     "required_min": required_min,
+                     "clob_min_usdc": min_usdc_for_clob,
                      "min_order_size": cfg.min_order_size},
                 )
                 return

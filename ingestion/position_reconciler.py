@@ -40,6 +40,13 @@ class PositionReconciler:
         self.state = state
         self._running = False
         self._ran_startup_cleanup = False
+        # Throttle the "on-chain > ledger; not auto-crediting" log.
+        # The drift is a static observation about a wallet that has
+        # more cash than the ledger thinks; logging it every 3-min
+        # cycle just spams the events tab. Re-log only when the
+        # observation materially changes (>$0.10) or once an hour.
+        self._last_credit_log_drift: Optional[float] = None
+        self._last_credit_log_at: float = 0.0
 
     async def run(self) -> None:
         self._running = True
@@ -329,11 +336,23 @@ class PositionReconciler:
         #              way and could double-count a deposit).
         if drift <= cfg.reconciler_drift_min_correct:
             if drift < -1.0:
-                await db.log_event(
-                    "info", "reconciler",
-                    f"on-chain ${on_chain:.2f} > ledger ${trading + gain:.2f} "
-                    f"(diff ${-drift:.2f}); not auto-crediting — deposit?",
+                # Throttle: only log when the drift materially changes
+                # or an hour has passed since last log. The static
+                # observation isn't actionable enough to warrant every
+                # 3-min cycle.
+                changed = (
+                    self._last_credit_log_drift is None
+                    or abs(self._last_credit_log_drift - drift) > 0.10
                 )
+                stale = (time.time() - self._last_credit_log_at) > 3600
+                if changed or stale:
+                    await db.log_event(
+                        "info", "reconciler",
+                        f"on-chain ${on_chain:.2f} > ledger ${trading + gain:.2f} "
+                        f"(diff ${-drift:.2f}); not auto-crediting — deposit?",
+                    )
+                    self._last_credit_log_drift = drift
+                    self._last_credit_log_at = time.time()
             return
 
         # Cap a single auto-correction so a flaky RPC or unexpected state

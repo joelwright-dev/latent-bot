@@ -643,6 +643,14 @@ class StrategyE:
                 return False
 
         # --- Sizing ---
+        # Polymarket CLOB rejects orders below 5 shares per side. At
+        # high prices ($0.99) that means a $4.95 minimum even though
+        # min_order_size in USDC might be lower. Bump the size up to
+        # the share-floor when the pool can fund it; skip otherwise.
+        CLOB_MIN_SHARES = 5
+        min_usdc_for_clob = CLOB_MIN_SHARES * our_price
+        required_min = max(cfg.min_order_size, min_usdc_for_clob)
+
         async with self._pending_lock:
             pool = await get_trading_balance(self.state.db)
             effective_available = pool - self._pending_usdc
@@ -650,17 +658,26 @@ class StrategyE:
             desired = min(base_size, cfg.strategy_e_max_position)
             deployable = max(0.0, effective_available - cfg.trading_pool_pause_threshold)
             size = min(desired, deployable)
-            if size < cfg.min_order_size:
+
+            # Bump up to CLOB share-floor if pool can fund it.
+            if size < required_min and deployable >= required_min:
+                size = min(required_min, cfg.strategy_e_max_position, deployable)
+
+            if size < required_min:
                 await self.state.db.log_event(
                     "info", "strategy_e",
-                    f"skip (pool sizing too small: desired ${desired:.2f}, "
-                    f"size ${size:.2f} < min ${cfg.min_order_size:.2f}; "
-                    f"pool=${pool:.2f}, deployable=${deployable:.2f}, "
+                    f"skip (sizing: size ${size:.2f} < required "
+                    f"${required_min:.2f} [usdc_min ${cfg.min_order_size:.2f}, "
+                    f"clob_min {CLOB_MIN_SHARES} shares × ${our_price:.3f} = "
+                    f"${min_usdc_for_clob:.2f}]; pool=${pool:.2f}, "
+                    f"deployable=${deployable:.2f}, "
                     f"pause=${cfg.trading_pool_pause_threshold:.2f}) from "
                     f"{whale.pseudonym}: {title[:60]} [{outcome}]",
                     {"whale": whale.wallet, "token_id": token_id,
                      "pool": pool, "desired": desired, "size": size,
+                     "required_min": required_min,
                      "min_order_size": cfg.min_order_size,
+                     "clob_min_usdc": min_usdc_for_clob,
                      "deploy_rate": cfg.strategy_e_deploy_rate,
                      "pause_threshold": cfg.trading_pool_pause_threshold},
                 )
