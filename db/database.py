@@ -28,7 +28,7 @@ import aiosqlite
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
@@ -193,6 +193,67 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_config_presets_scope "
                     "ON config_presets(scope)"
                 )
+            elif target == 13:
+                # v12 -> v13: widen strategy check to allow 'E'.
+                # By v13 the positions table has accumulated columns that
+                # the v5-v8 rebuild block doesn't know about (peak_price,
+                # exit_reason, leader_wallet, pm_last_*, etc.), so we
+                # can't reuse SELECT *. Rebuild explicitly column-by-column,
+                # discovering live columns at runtime so future v10+
+                # additions don't break this.
+                cur13 = await self._conn.execute("PRAGMA table_info(positions)")
+                live_cols = await cur13.fetchall()
+                if live_cols:
+                    col_names = [r[1] for r in live_cols]
+                    # Carry every column over verbatim, only changing the
+                    # strategy CHECK. We capture each column's type/notnull/
+                    # default/pk from PRAGMA so the rebuilt table matches.
+                    # cid, name, type, notnull, dflt_value, pk
+                    col_defs = []
+                    for r in live_cols:
+                        name, typ, notnull, dflt, pk = r[1], r[2], r[3], r[4], r[5]
+                        if name == "strategy":
+                            d = "strategy TEXT NOT NULL CHECK(strategy IN ('A', 'B', 'C', 'D', 'E', 'M'))"
+                        elif name == "id" and pk:
+                            d = "id INTEGER PRIMARY KEY AUTOINCREMENT"
+                        elif name == "market_token_id":
+                            d = "market_token_id TEXT NOT NULL REFERENCES markets(token_id)"
+                        elif name == "status":
+                            d = ("status TEXT NOT NULL DEFAULT 'open' "
+                                 "CHECK(status IN ('open', 'settled', 'cancelled', "
+                                 "'failed', 'awaiting_redeem'))")
+                        else:
+                            parts = [name, typ or "TEXT"]
+                            if notnull:
+                                parts.append("NOT NULL")
+                            if dflt is not None:
+                                parts.append(f"DEFAULT {dflt}")
+                            d = " ".join(parts)
+                        col_defs.append(d)
+
+                    cols_sql = ",\n                            ".join(col_defs)
+                    insert_cols = ", ".join(col_names)
+                    await self._conn.execute("PRAGMA foreign_keys = OFF")
+                    await self._conn.execute(f"""
+                        CREATE TABLE positions_new (
+                            {cols_sql}
+                        )
+                    """)
+                    await self._conn.execute(
+                        f"INSERT INTO positions_new ({insert_cols}) "
+                        f"SELECT {insert_cols} FROM positions"
+                    )
+                    await self._conn.execute("DROP TABLE positions")
+                    await self._conn.execute(
+                        "ALTER TABLE positions_new RENAME TO positions"
+                    )
+                    for idx_sql in (
+                        "CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)",
+                        "CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_token_id)",
+                        "CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy)",
+                    ):
+                        await self._conn.execute(idx_sql)
+                    await self._conn.execute("PRAGMA foreign_keys = ON")
             elif target in (5, 6, 7, 8):
                 # v4 -> v5: widen strategy check to ('A','B','C').
                 # v5 -> v6: widen strategy check to ('A','B','C','D').

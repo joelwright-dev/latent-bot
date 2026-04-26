@@ -508,19 +508,27 @@ class StrategyE:
         # --- Live ask check ---
         current_ask = await self._live_best_ask(token_id)
         if current_ask is None:
-            # Empty book usually means the market closed for orders.
-            # Surface the timing so the user can tell "we lost the race"
-            # (resolved minutes ago, no time to react) vs "market is
-            # genuinely illiquid right now".
-            timing = (
-                f"resolved {-hours_to_resolve*60:.0f}m ago"
-                if hours_to_resolve < 0
-                else f"{hours_to_resolve*60:.0f}m to resolve"
-            )
+            # Empty book has two distinct causes:
+            #   1) Past resolution: book closed ~30s after endDate.
+            #      We lost the latency race.
+            #   2) Pre-resolution illiquidity: just-listed market, no
+            #      makers yet. The whale may have eaten the book or
+            #      placed a maker order; copying via taker fails.
+            # Phrase the log accordingly so the user can diagnose.
+            if hours_to_resolve < 0:
+                reason = (
+                    f"resolved {-hours_to_resolve*60:.0f}m ago, book closed — "
+                    f"lost latency race"
+                )
+            else:
+                reason = (
+                    f"{hours_to_resolve*60:.0f}m to resolve, no asks — "
+                    f"market illiquid (whale may have eaten book)"
+                )
             await self.state.db.log_event(
                 "info", "strategy_e",
-                f"skip (no live ask, {timing} — market likely closed for "
-                f"orders) from {whale.pseudonym}: {title[:60]} [{outcome}]",
+                f"skip (no live ask, {reason}) from {whale.pseudonym}: "
+                f"{title[:60]} [{outcome}]",
                 {"whale": whale.wallet, "token_id": token_id,
                  "hours_to_resolve": hours_to_resolve},
             )

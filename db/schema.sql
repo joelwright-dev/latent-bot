@@ -64,7 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_deps_child ON market_dependencies(child_market_id
 CREATE TABLE IF NOT EXISTS positions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     market_token_id TEXT NOT NULL REFERENCES markets(token_id),
-    strategy        TEXT NOT NULL CHECK(strategy IN ('A', 'B', 'C', 'D', 'M')),
+    strategy        TEXT NOT NULL CHECK(strategy IN ('A', 'B', 'C', 'D', 'E', 'M')),
     entry_price     REAL NOT NULL,
     size_usdc       REAL NOT NULL,
     shares          REAL NOT NULL,
