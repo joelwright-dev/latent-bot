@@ -117,7 +117,8 @@ class Config:
     strategy_e_min_whale_bet_usdc: float        # only follow whale trades >= this size (0 = disable)
     strategy_e_max_price_slippage_abs: float    # don't chase if ask moved up by more than $X since whale fill
     strategy_e_whale_allowlist: str             # comma-separated wallets always tracked (in addition to leaderboard cohort)
-    strategy_e_per_token_cooldown_secs: int     # after one copy on (whale, market), ignore further fills for N secs (iceberg dedup)
+    strategy_e_per_token_cooldown_secs: int     # after one COPY on (whale, market), ignore further fills for N secs (iceberg dedup)
+    strategy_e_skip_cooldown_secs: int          # after a SKIP, short cooldown so we don't re-evaluate the same iceberg burst, but later fills (different state) still get a chance
 
     # PositionMonitor (auto-exit logic for Strategy D copy trades)
     monitor_enabled: bool
@@ -272,6 +273,7 @@ def _build(values: dict[str, Optional[str]]) -> Config:
         strategy_e_deploy_rate=_f(values.get("STRATEGY_E_DEPLOY_RATE"), 0.10),
         strategy_e_min_whale_bet_usdc=_f(values.get("STRATEGY_E_MIN_WHALE_BET_USDC"), 0.0),
         strategy_e_per_token_cooldown_secs=_i(values.get("STRATEGY_E_PER_TOKEN_COOLDOWN_SECS"), 3600),
+        strategy_e_skip_cooldown_secs=_i(values.get("STRATEGY_E_SKIP_COOLDOWN_SECS"), 60),
         strategy_e_max_price_slippage_abs=_f(values.get("STRATEGY_E_MAX_PRICE_SLIPPAGE_ABS"), 0.02),
         strategy_e_whale_allowlist=_s(
             values.get("STRATEGY_E_WHALE_ALLOWLIST"),

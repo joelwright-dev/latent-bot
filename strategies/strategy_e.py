@@ -157,10 +157,9 @@ class StrategyE:
         now = int(time.time())
         window_cutoff = now - cfg.strategy_e_copy_window_secs
 
-        # GC the per-token cooldown set so it doesn't grow forever.
-        cooldown_cutoff = now - cfg.strategy_e_per_token_cooldown_secs
+        # GC expired cooldowns. Values are absolute expiry timestamps.
         self._token_cooldown = {
-            k: v for k, v in self._token_cooldown.items() if v >= cooldown_cutoff
+            k: v for k, v in self._token_cooldown.items() if v > now
         }
 
         results = await asyncio.gather(
@@ -211,13 +210,11 @@ class StrategyE:
 
             for token_id, grp in buys_by_token.items():
                 key = (whale.wallet.lower(), token_id)
-                last_copied = self._token_cooldown.get(key, 0.0)
-                if last_copied >= cooldown_cutoff:
-                    # Already copied this whale on this market recently.
-                    # Don't even log — would spam during iceberg fills.
+                if self._token_cooldown.get(key, 0) > now:
+                    # Cooldown still active — silent skip to avoid spam.
                     continue
 
-                await self._consider_copy(
+                copied = await self._consider_copy(
                     cfg, whale, token_id,
                     their_price=grp["latest_price"],
                     their_bet=grp["total_usdc"],
@@ -226,12 +223,18 @@ class StrategyE:
                     trade_ts=grp["latest_ts"],
                     fills=grp["fills"],
                 )
-                # Cooldown set on EVERY evaluation (copy or skip). Without
-                # this, an iceberg of 24 fresh fills logs the same skip
-                # 24 times. If the user fixes the underlying issue (pool
-                # too small etc.) and wants a retry on the same market,
-                # they can shorten STRATEGY_E_PER_TOKEN_COOLDOWN_SECS.
-                self._token_cooldown[key] = float(now)
+                # Two-tier cooldown:
+                #   COPY  -> long (per_token_cooldown_secs, default 1h):
+                #            we already have a position, ignore further
+                #            iceberg fills entirely.
+                #   SKIP  -> short (skip_cooldown_secs, default 60s):
+                #            just enough to dedup an iceberg burst, but
+                #            not so long that a later fill (which sees
+                #            different market state) gets swallowed.
+                if copied:
+                    self._token_cooldown[key] = now + cfg.strategy_e_per_token_cooldown_secs
+                else:
+                    self._token_cooldown[key] = now + cfg.strategy_e_skip_cooldown_secs
 
         # Cap memory: never let the seen set grow unbounded.
         if len(self._seen_trade_ids) > 50_000:
@@ -448,7 +451,7 @@ class StrategyE:
         # The whole edge is "decided market with auto-redeem coming
         # soon". Skip if endDate is far out or unknown (better to miss
         # than guess wrong on tail risk).
-        end_ts = await self._market_end_ts(token_id)
+        end_ts, end_ts_src = await self._market_end_ts(token_id)
         now = int(time.time())
         if end_ts is None:
             await self.state.db.log_event(
@@ -496,14 +499,21 @@ class StrategyE:
         # cancelled) and skip.
         if hours_to_resolve < -cfg.strategy_e_max_hours_past_resolve:
             our_lag = int(time.time()) - trade_ts
+            from datetime import datetime, timezone
+            end_iso = (
+                datetime.fromtimestamp(end_ts, tz=timezone.utc)
+                .strftime("%Y-%m-%d %H:%M UTC")
+            )
             await self.state.db.log_event(
                 "info", "strategy_e",
-                f"skip (resolved {-hours_to_resolve:.1f}h ago, "
-                f"past stale-cap {cfg.strategy_e_max_hours_past_resolve:.1f}h, "
-                f"our lag {our_lag}s) from {whale.pseudonym}: "
+                f"skip (endDate={end_iso} src={end_ts_src}, resolved "
+                f"{-hours_to_resolve:.1f}h ago > cap "
+                f"{cfg.strategy_e_max_hours_past_resolve:.1f}h, our lag "
+                f"{our_lag}s) from {whale.pseudonym}: "
                 f"{title[:60]} [{outcome}]",
                 {"whale": whale.wallet, "token_id": token_id,
                  "hours_to_resolve": hours_to_resolve,
+                 "end_ts": end_ts, "end_ts_src": end_ts_src,
                  "our_lag_secs": our_lag},
             )
             return False
@@ -643,19 +653,23 @@ class StrategyE:
     # ------------------------------------------------------------------
     # Market metadata helpers
     # ------------------------------------------------------------------
-    async def _market_end_ts(self, token_id: str) -> Optional[int]:
+    async def _market_end_ts(
+        self, token_id: str,
+    ) -> tuple[Optional[int], str]:
         """Resolve a token to its market endDate (unix seconds).
 
+        Returns (timestamp_or_None, source) where source is one of
+        'cache', 'db', 'gamma', 'unknown'. The source lets the operator
+        see in skip logs whether a stale cached value might be wrong.
+
         Cheap path: read resolution_timestamp from the markets table.
-        Fallback: live gamma fetch by clobTokenIds=token_id, cached so we
-        don't hammer gamma per tick. Cache is per-token; misses persist
-        for MARKET_END_CACHE_SECS so we don't keep retrying brand-new
-        markets gamma hasn't indexed yet.
+        Fallback: live gamma fetch by clobTokenIds=token_id, cached so
+        we don't hammer gamma per tick.
         """
         cached = self._end_ts_cache.get(token_id)
         now = time.time()
         if cached and (now - cached[1]) < MARKET_END_CACHE_SECS:
-            return cached[0]
+            return cached[0], "cache"
 
         row = await self.state.db.fetchone(
             "SELECT resolution_timestamp FROM markets WHERE token_id = ?",
@@ -664,12 +678,12 @@ class StrategyE:
         if row and row["resolution_timestamp"]:
             ts = int(row["resolution_timestamp"])
             self._end_ts_cache[token_id] = (ts, now)
-            return ts
+            return ts, "db"
 
         # Not in our registry yet — try gamma directly.
         ts = await self._fetch_end_ts_from_gamma(token_id)
         self._end_ts_cache[token_id] = (ts, now)
-        return ts
+        return ts, ("gamma" if ts is not None else "unknown")
 
     async def _fetch_end_ts_from_gamma(self, token_id: str) -> Optional[int]:
         """Look up a market by its clobTokenId and return endDate (unix s)."""
