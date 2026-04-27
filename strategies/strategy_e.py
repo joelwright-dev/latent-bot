@@ -397,28 +397,13 @@ class StrategyE:
         their_bet: float, title: str, outcome: str, trade_ts: int,
         fills: int = 1,
     ) -> bool:
-        # --- Position dedup ---
-        # Mirror the whale once per market, not once per fill. Whales
-        # iceberg-split a single conviction buy into many fills over
-        # minutes; we only want one position. Two checks:
-        #   1) Open/awaiting-redeem E position on this token already?
-        #   2) Did we emit an order for this token in the last ~30s
-        #      (the executor hasn't yet INSERTed the position row)?
-        existing = await self.state.db.fetchval(
-            "SELECT id FROM positions "
-            "WHERE strategy = 'E' AND market_token_id = ? "
-            "  AND status IN ('open', 'awaiting_redeem')",
-            (token_id,),
-        )
-        if existing:
-            await self.state.db.log_event(
-                "info", "strategy_e",
-                f"skip (already have open E position #{existing}) from "
-                f"{whale.pseudonym}: {title[:60]} [{outcome}]",
-                {"whale": whale.wallet, "token_id": token_id,
-                 "existing_position_id": existing},
-            )
-            return False
+        # --- Emit-race guard ---
+        # Stacking is allowed: each fresh whale fill (new transactionHash
+        # via _seen_trade_ids) may produce its own bid. The only thing
+        # we still block is the narrow window between emitting an order
+        # and the executor INSERTing its positions row — without this,
+        # back-to-back ticks could double-emit on the same fill before
+        # _seen_trade_ids picks it up via the next /activity poll.
         if (time.time() - self._pending_tokens.get(token_id, 0.0)) < 30:
             await self.state.db.log_event(
                 "info", "strategy_e",

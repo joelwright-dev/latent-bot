@@ -40,11 +40,8 @@ class PositionReconciler:
         self.state = state
         self._running = False
         self._ran_startup_cleanup = False
-        # Throttle the "on-chain > ledger; not auto-crediting" log.
-        # The drift is a static observation about a wallet that has
-        # more cash than the ledger thinks; logging it every 3-min
-        # cycle just spams the events tab. Re-log only when the
-        # observation materially changes (>$0.10) or once an hour.
+        # Throttle the "drift exceeds auto-correct cap" log so a
+        # large persistent gap doesn't spam the events tab every cycle.
         self._last_credit_log_drift: Optional[float] = None
         self._last_credit_log_at: float = 0.0
 
@@ -340,80 +337,99 @@ class PositionReconciler:
 
         # drift > 0  → ledger thinks we have more cash than we do (over-credited
         #              somewhere, usually a near-zero auto-redeem). Debit.
-        # drift < 0  → ledger thinks we have less than we do. Almost always
-        #              means the user manually deposited; surface the gap but
-        #              don't auto-credit (would mask real bugs going the other
-        #              way and could double-count a deposit).
-        if drift <= cfg.reconciler_drift_min_correct:
-            if drift < -1.0:
-                # Throttle: only log when the drift materially changes
-                # or an hour has passed since last log. The static
-                # observation isn't actionable enough to warrant every
-                # 3-min cycle.
-                changed = (
-                    self._last_credit_log_drift is None
-                    or abs(self._last_credit_log_drift - drift) > 0.10
-                )
-                stale = (time.time() - self._last_credit_log_at) > 3600
-                if changed or stale:
-                    await db.log_event(
-                        "info", "reconciler",
-                        f"on-chain ${on_chain:.2f} > ledger ${trading + gain:.2f} "
-                        f"(diff ${-drift:.2f}); not auto-crediting — deposit?",
-                    )
-                    self._last_credit_log_drift = drift
-                    self._last_credit_log_at = time.time()
+        # drift < 0  → ledger thinks we have less than we do. Auto-credit the
+        #              gap into the trading pool. This setup is fully
+        #              bot-driven — no manual deposits to double-count — so
+        #              symmetry with the debit path is correct, and saves
+        #              the user from having to click "claim surplus" by hand.
+        magnitude = abs(drift)
+        if magnitude <= cfg.reconciler_drift_min_correct:
             return
 
         # Cap a single auto-correction so a flaky RPC or unexpected state
-        # can't nuke the pool. Over-cap drifts wait for the user.
-        if drift > cfg.reconciler_drift_max_correct:
-            await db.log_event(
-                "warn", "reconciler",
-                f"drift ${drift:.2f} exceeds auto-correct cap "
-                f"${cfg.reconciler_drift_max_correct:.2f}; skipping — "
-                f"use the dashboard reconcile button to apply manually",
+        # can't nuke the pool (or balloon it). Over-cap drifts wait for
+        # the user to apply via the dashboard reconcile / claim-surplus
+        # buttons. Throttle the log so a persistent over-cap gap doesn't
+        # spam the events tab every cycle.
+        if magnitude > cfg.reconciler_drift_max_correct:
+            changed = (
+                self._last_credit_log_drift is None
+                or abs(self._last_credit_log_drift - drift) > 0.10
             )
+            stale = (time.time() - self._last_credit_log_at) > 3600
+            if changed or stale:
+                direction = "ledger > on-chain" if drift > 0 else "on-chain > ledger"
+                await db.log_event(
+                    "warn", "reconciler",
+                    f"{direction} drift ${magnitude:.2f} exceeds auto-correct "
+                    f"cap ${cfg.reconciler_drift_max_correct:.2f}; skipping — "
+                    f"use the dashboard buttons to apply manually",
+                )
+                self._last_credit_log_drift = drift
+                self._last_credit_log_at = time.time()
             return
 
-        # Debit trading first; spill into gain if trading can't absorb it.
-        from_trading = min(drift, max(0.0, trading))
-        from_gain = max(0.0, drift - from_trading)
-        memo = (f"auto-reconcile drift ${drift:.2f}"
-                + (" (post-settle)" if triggered_by_settle else ""))
+        memo_suffix = " (post-settle)" if triggered_by_settle else ""
 
-        async with db.transaction() as conn:
-            if from_trading > 0:
-                new_trading = trading - from_trading
+        if drift > 0:
+            # Debit trading first; spill into gain if trading can't absorb it.
+            from_trading = min(drift, max(0.0, trading))
+            from_gain = max(0.0, drift - from_trading)
+            memo = f"auto-reconcile drift ${drift:.2f}{memo_suffix}"
+            async with db.transaction() as conn:
+                if from_trading > 0:
+                    new_trading = trading - from_trading
+                    await conn.execute(
+                        "INSERT INTO pool_ledger(timestamp, event_type, amount, "
+                        "pool, balance_after, position_id, memo) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (int(time.time()), "adjustment", -from_trading, "trading",
+                         new_trading, None, memo),
+                    )
+                if from_gain > 0:
+                    new_gain = gain - from_gain
+                    await conn.execute(
+                        "INSERT INTO pool_ledger(timestamp, event_type, amount, "
+                        "pool, balance_after, position_id, memo) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (int(time.time()), "adjustment", -from_gain, "gain",
+                         new_gain, None, memo),
+                    )
+            log.info(
+                "auto-reconciled drift: %.4f (trading -%.4f, gain -%.4f) "
+                "on_chain=%.4f", drift, from_trading, from_gain, on_chain,
+            )
+            await db.log_event(
+                "info", "reconciler",
+                f"auto-reconciled drift -${drift:.2f}: "
+                f"on-chain ${on_chain:.2f} = ledger ${on_chain:.2f}",
+                {"drift": drift, "from_trading": from_trading,
+                 "from_gain": from_gain, "on_chain": on_chain},
+            )
+        else:
+            # drift < 0 → wallet has more cash than the ledger knows.
+            # Credit the surplus into the trading pool.
+            surplus = magnitude
+            new_trading = trading + surplus
+            memo = f"auto-claim surplus ${surplus:.2f}{memo_suffix}"
+            async with db.transaction() as conn:
                 await conn.execute(
                     "INSERT INTO pool_ledger(timestamp, event_type, amount, "
                     "pool, balance_after, position_id, memo) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (int(time.time()), "adjustment", -from_trading, "trading",
+                    (int(time.time()), "adjustment", surplus, "trading",
                      new_trading, None, memo),
                 )
-            if from_gain > 0:
-                new_gain = gain - from_gain
-                await conn.execute(
-                    "INSERT INTO pool_ledger(timestamp, event_type, amount, "
-                    "pool, balance_after, position_id, memo) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (int(time.time()), "adjustment", -from_gain, "gain",
-                     gain - from_gain, None, memo),
-                )
-
-        log.info(
-            "auto-reconciled drift: %.4f (trading -%.4f, gain -%.4f) "
-            "on_chain=%.4f → ledger=%.4f",
-            drift, from_trading, from_gain, on_chain, on_chain,
-        )
-        await db.log_event(
-            "info", "reconciler",
-            f"auto-reconciled drift -${drift:.2f}: "
-            f"on-chain ${on_chain:.2f} = ledger ${on_chain:.2f}",
-            {"drift": drift, "from_trading": from_trading,
-             "from_gain": from_gain, "on_chain": on_chain},
-        )
+            log.info(
+                "auto-claimed surplus: +%.4f (trading) on_chain=%.4f",
+                surplus, on_chain,
+            )
+            await db.log_event(
+                "info", "reconciler",
+                f"auto-claimed surplus +${surplus:.2f}: "
+                f"on-chain ${on_chain:.2f} = ledger ${on_chain:.2f}",
+                {"surplus": surplus, "on_chain": on_chain},
+            )
 
     async def _settle_from_snapshot(self, row) -> None:
         """Position disappeared from PM → was auto-redeemed.
