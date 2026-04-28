@@ -19,6 +19,8 @@
     .btn:hover { background: #334155; }
     .btn-pri { background: #0ea5e9; border-color: #0284c7; color: #0b1220; }
     .btn-pri:hover { background: #38bdf8; }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
     .tab { padding: 8px 14px; cursor: pointer; border-bottom: 2px solid transparent; color: #94a3b8; }
     .tab.active { color: #e2e8f0; border-color: #0ea5e9; }
     .log-line { font-size: 12px; padding: 3px 8px; border-left: 3px solid transparent; }
@@ -501,6 +503,110 @@
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <!-- Leaderboard prospects: shadow-scored whales, promotable to allowlist -->
+      <div class="card p-3 sm:p-4 space-y-3">
+        <div class="flex items-baseline gap-2 flex-wrap">
+          <h3 class="text-base sm:text-lg font-semibold">Leaderboard prospects</h3>
+          <div class="text-xs text-slate-500">
+            Shadow-scored against current E criteria
+            <span v-if="whaleProspectsMeta.criteria">
+              (price ≥ {{ whaleProspectsMeta.criteria.min_entry_price }},
+              ≤ {{ whaleProspectsMeta.criteria.max_hours_to_resolve }}h to resolve).
+            </span>
+            Hypothetical PnL is per $1 wagered. Promote to add the wallet to STRATEGY_E_WHALE_ALLOWLIST.
+          </div>
+          <button class="btn ml-auto" @click="loadWhaleProspects">refresh</button>
+        </div>
+        <div v-if="promoteMsg" class="text-xs"
+             :class="promoteMsg.startsWith('✓') ? 'text-emerald-400' : 'text-rose-400'">
+          {{ promoteMsg }}
+        </div>
+        <div v-if="whaleProspects.length === 0" class="text-center text-slate-500 py-6">
+          No scored whales yet — the scorer runs every 6h, first pass takes ~2 min after boot.
+        </div>
+        <!-- Desktop table -->
+        <div class="hidden md:block overflow-x-auto">
+          <table class="tbl w-full text-sm">
+            <thead>
+              <tr>
+                <th>Whale</th>
+                <th class="text-right" title="Win rate on hypothetical signals (resolved markets only)">Win rate</th>
+                <th class="text-right" title="Number of historical trades that matched E criteria">Signals</th>
+                <th class="text-right" title="Hypothetical PnL per $1 wagered if you'd been following them">PnL/$</th>
+                <th class="text-right" title="30-day leaderboard PnL (USD)">30d $</th>
+                <th class="text-right">Last trade</th>
+                <th class="text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="p in whaleProspects" :key="p.wallet">
+                <td>
+                  <div class="font-semibold">{{ p.pseudonym || (p.wallet.slice(0,8) + '…') }}</div>
+                  <div class="text-xs text-slate-500 num">{{ p.wallet.slice(0,8) }}…{{ p.wallet.slice(-4) }}</div>
+                  <span v-if="p.in_allowlist" class="pill bg-indigo-900 text-indigo-200 text-xs mt-1">📌 live</span>
+                </td>
+                <td class="text-right num"
+                    :class="p.win_rate === null ? 'text-slate-600' : (p.win_rate >= 0.85 ? 'text-emerald-400' : (p.win_rate >= 0.6 ? 'text-amber-300' : 'text-rose-400'))">
+                  {{ p.win_rate === null ? '—' : (p.win_rate * 100).toFixed(0) + '%' }}
+                </td>
+                <td class="text-right num">
+                  {{ p.wins_n }}W / {{ p.losses_n }}L
+                  <span v-if="p.pending_n > 0" class="text-slate-500">+{{ p.pending_n }}p</span>
+                </td>
+                <td class="text-right num"
+                    :class="p.hypothetical_pnl_per_dollar > 0 ? 'text-emerald-400' : (p.hypothetical_pnl_per_dollar < 0 ? 'text-rose-400' : 'text-slate-500')">
+                  {{ p.hypothetical_pnl_per_dollar >= 0 ? '+' : '' }}${{ fmt(p.hypothetical_pnl_per_dollar, 3) }}
+                </td>
+                <td class="text-right num text-slate-400">
+                  <span v-if="p.pnl_window">${{ fmt(p.pnl_window, 0) }}</span>
+                  <span v-else class="text-slate-600">—</span>
+                </td>
+                <td class="text-right num text-slate-500 text-xs">
+                  {{ p.last_trade_ts ? fmtAgeDelta(Math.floor(Date.now()/1000) - p.last_trade_ts) + ' ago' : '—' }}
+                </td>
+                <td class="text-right">
+                  <button v-if="p.in_allowlist" class="btn btn-sm" @click="demoteWhale(p.wallet)" title="Remove from STRATEGY_E_WHALE_ALLOWLIST">demote</button>
+                  <button v-else class="btn btn-sm bg-emerald-700 hover:bg-emerald-600"
+                          :disabled="p.signals_n < 3"
+                          :title="p.signals_n < 3 ? 'Need at least 3 signals to evaluate' : 'Add to STRATEGY_E_WHALE_ALLOWLIST'"
+                          @click="promoteWhale(p.wallet)">
+                    promote
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <!-- Mobile cards -->
+        <div class="md:hidden space-y-2">
+          <div v-for="p in whaleProspects" :key="p.wallet" class="rounded border border-slate-800 p-2 space-y-1">
+            <div class="flex items-baseline gap-2 flex-wrap">
+              <span class="font-semibold text-sm">{{ p.pseudonym || (p.wallet.slice(0,8) + '…') }}</span>
+              <span v-if="p.in_allowlist" class="pill bg-indigo-900 text-indigo-200 text-xs">📌 live</span>
+              <span class="text-xs text-slate-500 num ml-auto">{{ p.wallet.slice(0,6) }}…{{ p.wallet.slice(-4) }}</span>
+            </div>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <span class="pill"
+                    :class="p.win_rate === null ? 'bg-slate-800 text-slate-500' : (p.win_rate >= 0.85 ? 'bg-emerald-900 text-emerald-200' : (p.win_rate >= 0.6 ? 'bg-amber-900 text-amber-200' : 'bg-rose-900 text-rose-200'))">
+                {{ p.win_rate === null ? 'no data' : (p.win_rate * 100).toFixed(0) + '% wins' }}
+              </span>
+              <span class="pill bg-slate-800 text-slate-300">{{ p.wins_n }}W / {{ p.losses_n }}L<span v-if="p.pending_n">+{{ p.pending_n }}p</span></span>
+              <span class="pill"
+                    :class="p.hypothetical_pnl_per_dollar > 0 ? 'bg-emerald-900 text-emerald-200' : (p.hypothetical_pnl_per_dollar < 0 ? 'bg-rose-900 text-rose-200' : 'bg-slate-800 text-slate-400')">
+                {{ p.hypothetical_pnl_per_dollar >= 0 ? '+' : '' }}${{ fmt(p.hypothetical_pnl_per_dollar, 3) }}/$
+              </span>
+              <span v-if="p.pnl_window" class="pill bg-slate-800 text-emerald-300">${{ fmt(p.pnl_window, 0) }} lb</span>
+            </div>
+            <div class="flex justify-end pt-1">
+              <button v-if="p.in_allowlist" class="btn btn-sm" @click="demoteWhale(p.wallet)">demote</button>
+              <button v-else class="btn btn-sm bg-emerald-700 hover:bg-emerald-600"
+                      :disabled="p.signals_n < 3"
+                      @click="promoteWhale(p.wallet)">promote</button>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -1489,6 +1595,9 @@ createApp({
     const leadersMeta = reactive({});
     const whales = ref([]);
     const whalesMeta = reactive({});
+    const whaleProspects = ref([]);
+    const whaleProspectsMeta = reactive({});
+    const promoteMsg = ref('');
     const dStats = reactive({});
     const presetsLive = ref([]);
     const presetsBacktest = ref([]);
@@ -1682,6 +1791,41 @@ createApp({
           note: d.note,
         });
       } catch (e) { /* ignore */ }
+    };
+
+    const loadWhaleProspects = async () => {
+      try {
+        const d = await getJson('/api/whales/leaderboard');
+        whaleProspects.value = d.leaderboard || [];
+        Object.assign(whaleProspectsMeta, {
+          criteria: d.criteria || {},
+          allowlist_size: d.allowlist_size || 0,
+        });
+      } catch (e) { /* ignore */ }
+    };
+
+    const promoteWhale = async (wallet) => {
+      promoteMsg.value = '';
+      try {
+        await postJson('/api/whales/promote', { wallet });
+        promoteMsg.value = '✓ ' + wallet.slice(0, 8) + '… promoted; live within 1h';
+        setTimeout(() => promoteMsg.value = '', 5000);
+        await loadWhaleProspects();
+      } catch (e) {
+        promoteMsg.value = '✗ ' + e.message;
+      }
+    };
+
+    const demoteWhale = async (wallet) => {
+      promoteMsg.value = '';
+      try {
+        await postJson('/api/whales/demote', { wallet });
+        promoteMsg.value = '✓ ' + wallet.slice(0, 8) + '… demoted';
+        setTimeout(() => promoteMsg.value = '', 5000);
+        await loadWhaleProspects();
+      } catch (e) {
+        promoteMsg.value = '✗ ' + e.message;
+      }
     };
 
     const loadStrategyDStats = async () => {
@@ -2114,7 +2258,10 @@ createApp({
     watch(tab, (t) => {
       if (t === 'graph') setTimeout(loadGraph, 50);
       if (t === 'leaders') loadLeaders();
-      if (t === 'whales' || t === 'strategy e') loadWhales();
+      if (t === 'whales' || t === 'strategy e') {
+        loadWhales();
+        loadWhaleProspects();
+      }
       if (t === 'portfolio') loadPortfolio();
       if (t === 'strategy d') loadStrategyDStats();
       if (t === 'config') loadPresets();
@@ -2143,6 +2290,8 @@ createApp({
       graphEl, graphFilter, graphMeta, loadGraph,
       leaders, leadersMeta, loadLeaders, fmtAgeDelta,
       whales, whalesMeta, loadWhales,
+      whaleProspects, whaleProspectsMeta, loadWhaleProspects,
+      promoteWhale, demoteWhale, promoteMsg,
       dStats, loadStrategyDStats,
       forceRefreshDLeaders, rosterRefreshMsg,
       portfolio, loadPortfolio, ledgerDelta, reconcileLedger, reconcileBusy,
