@@ -21,6 +21,8 @@
     .btn-pri:hover { background: #38bdf8; }
     .btn-sm { padding: 4px 10px; font-size: 12px; }
     .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .profile-link { color: inherit; text-decoration: none; cursor: pointer; }
+    .profile-link:hover { color: #38bdf8; text-decoration: underline; }
     .tab { padding: 8px 14px; cursor: pointer; border-bottom: 2px solid transparent; color: #94a3b8; }
     .tab.active { color: #e2e8f0; border-color: #0ea5e9; }
     .log-line { font-size: 12px; padding: 3px 8px; border-left: 3px solid transparent; }
@@ -366,8 +368,8 @@
       </div>
       <div v-for="lead in leaders" :key="lead.wallet" class="card p-3 sm:p-4 space-y-3">
         <div class="flex items-baseline gap-2 sm:gap-3 flex-wrap">
-          <div class="text-base sm:text-lg font-semibold">{{ lead.pseudonym }}</div>
-          <div class="text-xs sm:text-sm text-slate-500 num">{{ lead.wallet.slice(0, 8) }}…{{ lead.wallet.slice(-4) }}</div>
+          <a :href="pmUrl(lead.wallet)" target="_blank" rel="noopener" class="profile-link text-base sm:text-lg font-semibold" title="Open on Polymarket">{{ lead.pseudonym }} ↗</a>
+          <a :href="pmUrl(lead.wallet)" target="_blank" rel="noopener" class="profile-link text-xs sm:text-sm text-slate-500 num">{{ lead.wallet.slice(0, 8) }}…{{ lead.wallet.slice(-4) }}</a>
           <div class="sm:ml-auto flex gap-2 sm:gap-4 items-baseline flex-wrap w-full sm:w-auto">
             <span class="text-xs text-slate-500">{{ lead.window || '7d' }}</span>
             <span class="text-emerald-400 num font-semibold">${{ fmt(lead.pnl_window ?? lead.pnl_7d, 0) }}</span>
@@ -451,8 +453,8 @@
       </div>
       <div v-for="w in whales" :key="w.wallet" class="card p-3 sm:p-4 space-y-3">
         <div class="flex items-baseline gap-2 sm:gap-3 flex-wrap">
-          <div class="text-base sm:text-lg font-semibold">{{ w.pseudonym }}</div>
-          <div class="text-xs sm:text-sm text-slate-500 num">{{ w.wallet.slice(0, 8) }}…{{ w.wallet.slice(-4) }}</div>
+          <a :href="pmUrl(w.wallet)" target="_blank" rel="noopener" class="profile-link text-base sm:text-lg font-semibold" title="Open on Polymarket">{{ w.pseudonym }} ↗</a>
+          <a :href="pmUrl(w.wallet)" target="_blank" rel="noopener" class="profile-link text-xs sm:text-sm text-slate-500 num">{{ w.wallet.slice(0, 8) }}…{{ w.wallet.slice(-4) }}</a>
           <span v-if="w.window === 'allowlist'" class="pill bg-indigo-900 text-indigo-200 text-xs">📌 allowlisted</span>
           <div class="sm:ml-auto flex gap-2 sm:gap-4 items-baseline flex-wrap w-full sm:w-auto">
             <span v-if="w.window !== 'allowlist'" class="text-xs text-slate-500">{{ w.window || '30d' }}</span>
@@ -551,8 +553,8 @@
             <tbody>
               <tr v-for="p in whaleProspects" :key="p.wallet">
                 <td>
-                  <div class="font-semibold">{{ p.pseudonym || (p.wallet.slice(0,8) + '…') }}</div>
-                  <div class="text-xs text-slate-500 num">{{ p.wallet.slice(0,8) }}…{{ p.wallet.slice(-4) }}</div>
+                  <a :href="pmUrl(p.wallet)" target="_blank" rel="noopener" class="profile-link font-semibold" title="Open on Polymarket">{{ p.pseudonym || (p.wallet.slice(0,8) + '…') }} ↗</a>
+                  <a :href="pmUrl(p.wallet)" target="_blank" rel="noopener" class="profile-link block text-xs text-slate-500 num">{{ p.wallet.slice(0,8) }}…{{ p.wallet.slice(-4) }}</a>
                   <span v-if="p.in_allowlist" class="pill bg-indigo-900 text-indigo-200 text-xs mt-1">📌 live</span>
                 </td>
                 <td class="text-right num"
@@ -591,9 +593,9 @@
         <div class="md:hidden space-y-2">
           <div v-for="p in whaleProspects" :key="p.wallet" class="rounded border border-slate-800 p-2 space-y-1">
             <div class="flex items-baseline gap-2 flex-wrap">
-              <span class="font-semibold text-sm">{{ p.pseudonym || (p.wallet.slice(0,8) + '…') }}</span>
+              <a :href="pmUrl(p.wallet)" target="_blank" rel="noopener" class="profile-link font-semibold text-sm" title="Open on Polymarket">{{ p.pseudonym || (p.wallet.slice(0,8) + '…') }} ↗</a>
               <span v-if="p.in_allowlist" class="pill bg-indigo-900 text-indigo-200 text-xs">📌 live</span>
-              <span class="text-xs text-slate-500 num ml-auto">{{ p.wallet.slice(0,6) }}…{{ p.wallet.slice(-4) }}</span>
+              <a :href="pmUrl(p.wallet)" target="_blank" rel="noopener" class="profile-link text-xs text-slate-500 num ml-auto">{{ p.wallet.slice(0,6) }}…{{ p.wallet.slice(-4) }}</a>
             </div>
             <div class="flex flex-wrap gap-2 text-xs">
               <span class="pill"
@@ -672,8 +674,8 @@
           <tbody>
             <tr v-for="w in [...whales].sort((a,b) => (b.copy_stats?.pnl ?? 0) - (a.copy_stats?.pnl ?? 0))" :key="w.wallet">
               <td>
-                <div class="font-medium">{{ w.pseudonym }}</div>
-                <div class="text-xs text-slate-500 num">{{ w.wallet.slice(0, 8) }}…{{ w.wallet.slice(-4) }}</div>
+                <a :href="pmUrl(w.wallet)" target="_blank" rel="noopener" class="profile-link font-medium" title="Open on Polymarket">{{ w.pseudonym }} ↗</a>
+                <a :href="pmUrl(w.wallet)" target="_blank" rel="noopener" class="profile-link block text-xs text-slate-500 num">{{ w.wallet.slice(0, 8) }}…{{ w.wallet.slice(-4) }}</a>
               </td>
               <td>
                 <span v-if="w.window === 'allowlist'" class="pill bg-indigo-900 text-indigo-200 text-xs">📌 allow</span>
@@ -800,7 +802,7 @@
             <template v-for="(cats, wallet) in dStats.per_leader_category" :key="wallet">
               <tr v-for="(c, i) in cats" :key="wallet + '_' + c.category">
                 <td class="num text-slate-400">
-                  <span v-if="i === 0">{{ wallet.slice(0, 8) }}…{{ wallet.slice(-4) }}</span>
+                  <a v-if="i === 0" :href="pmUrl(wallet)" target="_blank" rel="noopener" class="profile-link" title="Open on Polymarket">{{ wallet.slice(0, 8) }}…{{ wallet.slice(-4) }} ↗</a>
                 </td>
                 <td class="text-slate-300">{{ c.category }}</td>
                 <td class="text-right num">{{ c.trades }}</td>
@@ -974,7 +976,9 @@
           </thead>
           <tbody>
             <tr v-for="(s, wallet) in btResults.per_leader" :key="wallet">
-              <td class="text-slate-300">{{ s.pseudonym }} <span class="text-slate-600 text-xs num">{{ wallet.slice(0, 8) }}…</span></td>
+              <td class="text-slate-300">
+                <a :href="pmUrl(wallet)" target="_blank" rel="noopener" class="profile-link" title="Open on Polymarket">{{ s.pseudonym }} <span class="text-slate-600 text-xs num">{{ wallet.slice(0, 8) }}…</span> ↗</a>
+              </td>
               <td class="text-right num">{{ s.trades }}</td>
               <td class="text-right num">{{ s.wins }}</td>
               <td class="text-right num" :class="(s.trades > 0 && (s.wins / s.trades) >= 0.4) ? 'text-emerald-400' : 'text-rose-400'">
@@ -1665,6 +1669,10 @@ createApp({
 
     // ---------- helpers ----------
     const fmt = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '0.00' : Number(v).toFixed(d);
+    // Polymarket public profile URL — works directly with the proxy
+    // wallet address. Used wherever a wallet/pseudonym is rendered so
+    // the operator can jump to the trader's full activity in one click.
+    const pmUrl = (wallet) => wallet ? ('https://polymarket.com/profile/' + wallet) : '#';
     const fmtUptime = (s) => {
       if (!s) return '—';
       const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
@@ -2318,7 +2326,7 @@ createApp({
       portfolio, loadPortfolio, ledgerDelta, reconcileLedger, reconcileBusy,
       claimSurplus, claimBusy,
       forceReconcilePositions, reconcilePosBusy,
-      fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl,
+      fmt, fmtUptime, fmtAge, fmtDate, fmtHrs, askClass, estPnl, pmUrl,
       loadHistory, saveConfig, toggleStrategy, toggleBot, withdraw, transferGain,
       presetsLive, presetsBacktest, presetSelected, presetNewName, presetMsg,
       savePreset, applyPreset, deletePreset, saveMsg, pendingCount,
