@@ -28,7 +28,7 @@ import aiosqlite
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
@@ -254,6 +254,32 @@ class Database:
                     ):
                         await self._conn.execute(idx_sql)
                     await self._conn.execute("PRAGMA foreign_keys = ON")
+            elif target == 15:
+                # v14 -> v15: whale_scores table for shadow-scoring
+                # leaderboard prospects against Strategy E criteria.
+                # Lets the operator vet a whale's hypothetical track
+                # record before promoting them to the live allowlist.
+                await self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS whale_scores ("
+                    "  wallet                       TEXT PRIMARY KEY,"
+                    "  pseudonym                    TEXT,"
+                    "  pnl_window                   REAL,"
+                    "  leaderboard_window           TEXT,"
+                    "  signals_n                    INTEGER NOT NULL DEFAULT 0,"
+                    "  wins_n                       INTEGER NOT NULL DEFAULT 0,"
+                    "  losses_n                     INTEGER NOT NULL DEFAULT 0,"
+                    "  pending_n                    INTEGER NOT NULL DEFAULT 0,"
+                    "  hypothetical_pnl_per_dollar  REAL NOT NULL DEFAULT 0,"
+                    "  scored_min_entry_price       REAL,"
+                    "  scored_max_hours_to_resolve  REAL,"
+                    "  last_trade_ts                INTEGER,"
+                    "  last_computed_at             INTEGER NOT NULL"
+                    ")"
+                )
+                await self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_whale_scores_pnl "
+                    "ON whale_scores(hypothetical_pnl_per_dollar DESC)"
+                )
             elif target == 14:
                 # v13 -> v14: add positions.is_maker_resting flag.
                 # 1 = maker bid placed but not yet filled — principal NOT

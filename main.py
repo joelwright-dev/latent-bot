@@ -59,6 +59,7 @@ from execution.settlement import Settlement
 from ingestion.market_seeder import MarketSeeder
 from ingestion.polygon_rpc import PolygonListener
 from ingestion.polymarket_ws import PolymarketWSListener
+from analytics.whale_scorer import WhaleScorer
 from ingestion.position_reconciler import PositionReconciler
 from ingestion.state_manager import StateManager, set_state
 from strategies.dependency_graph import DependencyGraph
@@ -142,6 +143,7 @@ async def main() -> None:
     executor = Executor(state)
     settlement = Settlement(state, clob=clob)
     monitor = PositionMonitor(state, clob=clob)
+    whale_scorer = WhaleScorer(state)
 
     app = create_app(state)
     app.state.git_commit = GIT_COMMIT
@@ -153,7 +155,7 @@ async def main() -> None:
     def _signal(*_):
         log.info("shutdown signal received")
         stop_event.set()
-        for c in (polygon, ws_in, seeder, reconciler, graph_builder, strat_a, strat_b, strat_c, strat_d, strat_e, executor, settlement, monitor):
+        for c in (polygon, ws_in, seeder, reconciler, graph_builder, strat_a, strat_b, strat_c, strat_d, strat_e, executor, settlement, monitor, whale_scorer):
             try:
                 c.stop()
             except Exception:
@@ -183,6 +185,7 @@ async def main() -> None:
         asyncio.create_task(executor.run(),    name="executor"),
         asyncio.create_task(settlement.run(),  name="settlement"),
         asyncio.create_task(monitor.run(),     name="position_monitor"),
+        asyncio.create_task(whale_scorer.run(), name="whale_scorer"),
         asyncio.create_task(ws_fanout_loop(app, state), name="ws_fanout"),
         asyncio.create_task(
             _run_web(app, cfg.dashboard_host, cfg.dashboard_port, stop_event),

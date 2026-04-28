@@ -1367,6 +1367,116 @@ def create_app(state: StateManager) -> FastAPI:
         }
 
     # ------------------------------------------------------------------
+    # GET /api/whales/leaderboard — shadow-scored prospects
+    # ------------------------------------------------------------------
+    # Powers the "leaderboard prospects" view: traders the bot has
+    # backtested against E criteria but isn't yet allowed to follow.
+    # The point is to let the user vet a whale's hypothetical track
+    # record before promoting them to the live allowlist.
+    #
+    # Sort key is hypothetical PnL per dollar — a whale with high
+    # win rate AND attractive entry prices ranks above a whale that
+    # only wins on coinflips.
+    @app.get("/api/whales/leaderboard")
+    async def whales_leaderboard() -> dict:
+        db = get_db()
+        rows = await db.fetchall(
+            "SELECT * FROM whale_scores "
+            "ORDER BY hypothetical_pnl_per_dollar DESC, signals_n DESC "
+            "LIMIT 100"
+        )
+        cfg = get_config()
+        allow = {
+            w.strip().lower()
+            for w in (cfg.strategy_e_whale_allowlist or "").split(",")
+            if w.strip()
+        }
+        out = []
+        for r in rows:
+            settled = int(r["wins_n"]) + int(r["losses_n"])
+            win_rate = (int(r["wins_n"]) / settled) if settled > 0 else None
+            out.append({
+                "wallet": r["wallet"],
+                "pseudonym": r["pseudonym"],
+                "pnl_window": r["pnl_window"],
+                "leaderboard_window": r["leaderboard_window"],
+                "in_allowlist": r["wallet"].lower() in allow,
+                "signals_n": int(r["signals_n"]),
+                "wins_n": int(r["wins_n"]),
+                "losses_n": int(r["losses_n"]),
+                "pending_n": int(r["pending_n"]),
+                "win_rate": win_rate,
+                "hypothetical_pnl_per_dollar": float(r["hypothetical_pnl_per_dollar"]),
+                "scored_min_entry_price": r["scored_min_entry_price"],
+                "scored_max_hours_to_resolve": r["scored_max_hours_to_resolve"],
+                "last_trade_ts": r["last_trade_ts"],
+                "last_computed_at": int(r["last_computed_at"]),
+            })
+        return {
+            "leaderboard": out,
+            "criteria": {
+                "min_entry_price": cfg.strategy_e_min_entry_price,
+                "max_hours_to_resolve": cfg.strategy_e_max_hours_to_resolve,
+            },
+            "allowlist_size": len(allow),
+        }
+
+    # ------------------------------------------------------------------
+    # POST /api/whales/promote — add a wallet to the E allowlist
+    # ------------------------------------------------------------------
+    # The "yes I trust this whale, follow them live" button. Updates the
+    # STRATEGY_E_WHALE_ALLOWLIST live config; the next strategy E
+    # _refresh_whales cycle (within 1 hour, or whenever cfg reloads)
+    # picks them up.
+    @app.post("/api/whales/promote",
+              dependencies=[Depends(require_auth)])
+    async def whales_promote(body: dict) -> dict:
+        wallet = (body.get("wallet") or "").strip().lower()
+        if not wallet or not wallet.startswith("0x") or len(wallet) != 42:
+            raise HTTPException(400, "wallet must be a 0x... address")
+        cfg = get_config()
+        current = [
+            w.strip().lower()
+            for w in (cfg.strategy_e_whale_allowlist or "").split(",")
+            if w.strip()
+        ]
+        if wallet in current:
+            return {"ok": True, "already": True, "allowlist": current}
+        current.append(wallet)
+        new_list = ",".join(current)
+        await update_config({"STRATEGY_E_WHALE_ALLOWLIST": new_list})
+        await state.broadcast(Signal(
+            kind=SignalKind.DASHBOARD_REFRESH,
+            payload={"section": "config"},
+            source="api",
+        ))
+        return {"ok": True, "allowlist": current}
+
+    # ------------------------------------------------------------------
+    # POST /api/whales/demote — remove a wallet from the E allowlist
+    # ------------------------------------------------------------------
+    @app.post("/api/whales/demote",
+              dependencies=[Depends(require_auth)])
+    async def whales_demote(body: dict) -> dict:
+        wallet = (body.get("wallet") or "").strip().lower()
+        if not wallet:
+            raise HTTPException(400, "wallet required")
+        cfg = get_config()
+        current = [
+            w.strip().lower()
+            for w in (cfg.strategy_e_whale_allowlist or "").split(",")
+            if w.strip() and w.strip().lower() != wallet
+        ]
+        new_list = ",".join(current)
+        await update_config({"STRATEGY_E_WHALE_ALLOWLIST": new_list})
+        await state.broadcast(Signal(
+            kind=SignalKind.DASHBOARD_REFRESH,
+            payload={"section": "config"},
+            source="api",
+        ))
+        return {"ok": True, "allowlist": current}
+
+    # ------------------------------------------------------------------
     # GET /api/strategy-d-stats — comprehensive analytics for Strategy D
     # ------------------------------------------------------------------
     @app.get("/api/strategy-d-stats")

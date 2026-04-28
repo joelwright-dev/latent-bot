@@ -157,6 +157,33 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 -- ---------------------------------------------------------------------------
+-- whale_scores: shadow-scoring for Strategy E leaderboard prospects.
+-- For each leaderboard whale, we backtest their recent BUYs against the
+-- E criteria (price >= min_entry, market resolves within window) and
+-- track hypothetical PnL. Lets the operator vet a whale's track record
+-- before adding them to the live allowlist.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS whale_scores (
+    wallet                       TEXT PRIMARY KEY,
+    pseudonym                    TEXT,
+    pnl_window                   REAL,            -- leaderboard PnL (USD)
+    leaderboard_window           TEXT,            -- e.g. '30d'
+    signals_n                    INTEGER NOT NULL DEFAULT 0,
+    wins_n                       INTEGER NOT NULL DEFAULT 0,
+    losses_n                     INTEGER NOT NULL DEFAULT 0,
+    pending_n                    INTEGER NOT NULL DEFAULT 0,
+    hypothetical_pnl_per_dollar  REAL NOT NULL DEFAULT 0,
+    -- Snapshot of E thresholds used at compute time, so the user knows
+    -- whether the score is stale relative to current config.
+    scored_min_entry_price       REAL,
+    scored_max_hours_to_resolve  REAL,
+    last_trade_ts                INTEGER,
+    last_computed_at             INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_whale_scores_pnl
+    ON whale_scores(hypothetical_pnl_per_dollar DESC);
+
+-- ---------------------------------------------------------------------------
 -- config_presets: named snapshots of live config OR backtest params.
 -- Used to quickly swap between tuning experiments without retyping values.
 -- ---------------------------------------------------------------------------
