@@ -28,7 +28,7 @@ import aiosqlite
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
@@ -254,6 +254,21 @@ class Database:
                     ):
                         await self._conn.execute(idx_sql)
                     await self._conn.execute("PRAGMA foreign_keys = ON")
+            elif target == 14:
+                # v13 -> v14: add positions.is_maker_resting flag.
+                # 1 = maker bid placed but not yet filled — principal NOT
+                # yet debited from trading_pool. Cleared on fill or cancel.
+                # Lets the executor + reconciler defer the trade_open
+                # ledger entry until the bid actually crosses, so the
+                # ledger no longer churns on emit/timeout cycles for the
+                # ~96% of E maker bids that never fill.
+                cur14 = await self._conn.execute("PRAGMA table_info(positions)")
+                cols = [r[1] for r in await cur14.fetchall()]
+                if cols and "is_maker_resting" not in cols:
+                    await self._conn.execute(
+                        "ALTER TABLE positions ADD COLUMN "
+                        "is_maker_resting INTEGER NOT NULL DEFAULT 0"
+                    )
             elif target in (5, 6, 7, 8):
                 # v4 -> v5: widen strategy check to ('A','B','C').
                 # v5 -> v6: widen strategy check to ('A','B','C','D').

@@ -696,6 +696,7 @@ class StrategyE:
             ),
             leader_wallet=whale.wallet,
             fill_timeout_secs=maker_timeout,
+            is_maker=is_maker_order,
         )
         lag_secs = int(time.time()) - trade_ts
         fills_str = f", {fills} fills" if fills > 1 else ""

@@ -58,6 +58,11 @@ class OrderRequest:
     # Strategy E maker orders need longer windows since they wait
     # passively for a counterparty rather than crossing the spread.
     fill_timeout_secs: Optional[int] = None
+    # True for maker orders that rest in the CLOB book waiting to be
+    # crossed (Strategy E maker mode). The executor defers the
+    # trade_open ledger debit until the bid actually fills, so resting
+    # bids that time out cost nothing — there's no debit to refund.
+    is_maker: bool = False
 
 
 # ---------------------------------------------------------------------------

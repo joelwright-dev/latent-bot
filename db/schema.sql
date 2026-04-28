@@ -89,6 +89,11 @@ CREATE TABLE IF NOT EXISTS positions (
     -- Strategy D: wallet of the leader this copy mirrors. Used by
     -- position_monitor for the trader_exit signal.
     leader_wallet   TEXT,
+    -- 1 = maker bid placed but not yet filled. Principal is NOT yet
+    -- debited from the trading pool — the trade_open ledger entry is
+    -- deferred until the bid actually crosses (or the bid is cancelled,
+    -- in which case there's nothing to refund). Cleared to 0 on fill.
+    is_maker_resting INTEGER NOT NULL DEFAULT 0,
     notes           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);

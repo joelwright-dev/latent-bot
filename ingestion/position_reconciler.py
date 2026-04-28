@@ -23,7 +23,10 @@ from typing import Optional
 
 import aiohttp
 
-from capital.pools import get_gain_balance, get_trading_balance, settle_trade
+from capital.pools import (
+    cancel_maker_bid, fill_maker_bid, get_gain_balance, get_trading_balance,
+    settle_trade,
+)
 from config import get_config
 from ingestion.onchain import fetch_usdc_e_balance
 from ingestion.state_manager import StateManager
@@ -235,13 +238,30 @@ class PositionReconciler:
         # 1) Update snapshots + insert new mirrors
         for token_id, p in pm_by_token.items():
             existing = await db.fetchone(
-                "SELECT id FROM positions "
+                "SELECT id, is_maker_resting, size_usdc FROM positions "
                 "WHERE market_token_id = ? "
                 "AND status IN ('open', 'awaiting_redeem') "
                 "ORDER BY id DESC LIMIT 1",
                 (token_id,),
             )
             if existing:
+                # Resting maker bid first appearing on /positions → it
+                # filled. Write the deferred trade_open ledger entry
+                # before updating the snapshot so available_balance is
+                # accurate before the next strategy tick. fill_maker_bid
+                # is idempotent against the executor's own watcher.
+                if existing["is_maker_resting"]:
+                    try:
+                        await fill_maker_bid(
+                            existing["id"],
+                            float(existing["size_usdc"]),
+                            db=db,
+                            memo=f"maker bid #{existing['id']} filled "
+                                 f"(detected by reconciler)",
+                        )
+                    except Exception as e:
+                        log.error("fill_maker_bid failed for #%s: %s",
+                                  existing["id"], e)
                 # Update snapshot fields + awaiting_redeem transition.
                 new_status = (
                     "awaiting_redeem" if p.get("redeemable") else None
@@ -460,6 +480,22 @@ class PositionReconciler:
             grace = get_config().reconciler_orphan_grace_hours
             if age_hours < grace:
                 # Maker order still in flight, or fresh taker. Skip.
+                return
+
+            # Branch on whether there was a real ledger debit to undo.
+            # Resting maker bids never wrote trade_open, so refunding
+            # would invent capital out of thin air. Just mark cancelled.
+            is_resting = bool(row["is_maker_resting"]) if "is_maker_resting" in row.keys() else False
+            if is_resting:
+                await cancel_maker_bid(pos_id, db=db)
+                await db.log_event(
+                    "info", "reconciler",
+                    f"maker bid #{pos_id} never appeared on Polymarket "
+                    f"after {age_hours:.1f}h (grace {grace:.1f}h) — "
+                    f"cancelled (no debit to refund)",
+                    {"position_id": pos_id, "principal": principal,
+                     "strategy": strategy, "age_hours": age_hours},
+                )
                 return
 
             from capital.pools import refund_trade

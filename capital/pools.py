@@ -72,22 +72,41 @@ async def get_gain_balance(db: Optional[Database] = None) -> float:
     return await _last_balance(db or get_db(), "gain")
 
 
+async def get_pending_maker_principal(db: Optional[Database] = None) -> float:
+    """Sum of principal locked in resting (unfilled) maker bids.
+
+    Maker bids defer their `trade_open` ledger debit until fill, so
+    `get_trading_balance` doesn't yet reflect them. We still need to
+    treat the principal as committed for sizing purposes — otherwise
+    the bot would happily place 10 × $5 bids on $20 of capital and
+    get rejected by the CLOB ("not enough balance / allowance").
+    """
+    db = db or get_db()
+    val = await db.fetchval(
+        "SELECT COALESCE(SUM(size_usdc), 0) FROM positions "
+        "WHERE is_maker_resting = 1 AND status = 'open'"
+    )
+    return float(val or 0.0)
+
+
 async def get_available_balance(db: Optional[Database] = None) -> float:
     """Cash the bot can deploy to a new order.
 
-    Equal to the trading-pool ledger balance — `open_trade` already
-    deducts principal at position-open time, so `trading_balance` is
-    always net of capital tied up in currently-open positions. The
-    historical version of this function subtracted `SUM(size_usdc
-    WHERE status='open')` as well, which double-counted and drove
-    `available` negative when open-position count was high, blocking
-    every new trade despite real cash being available.
+    Equals trading-pool ledger balance MINUS principal committed to
+    resting maker bids (which haven't yet hit the ledger but are
+    locked in CLOB active orders against the wallet's USDC).
+
+    Taker orders deduct principal at trade_open time and are already
+    folded into the ledger balance — only resting maker bids need the
+    extra subtraction.
 
     Strategy 'M' (mirror) positions never hit the ledger anyway —
     those are manual Polymarket trades reflected for display only.
     """
     db = db or get_db()
-    return await get_trading_balance(db)
+    bal = await get_trading_balance(db)
+    pending = await get_pending_maker_principal(db)
+    return bal - pending
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +268,87 @@ async def settle_trade(
         position_id, principal, gross_proceeds, gain, to_trading, to_gain,
     )
     return to_trading, to_gain, gain
+
+
+async def fill_maker_bid(
+    position_id: int,
+    size_usdc: float,
+    *,
+    db: Optional[Database] = None,
+    memo: Optional[str] = None,
+) -> Optional[float]:
+    """Record the deferred debit when a resting maker bid finally fills.
+
+    Idempotent: callable from both the executor's _watch_fill loop and
+    the reconciler's snapshot pass without risking a double debit. The
+    in-transaction `is_maker_resting` check is the guard — only one
+    caller will see the row in the resting state.
+
+    Returns the new trading balance, or None if the position wasn't
+    actually resting (already debited or doesn't exist).
+    """
+    if size_usdc <= 0:
+        raise PoolError(f"fill size must be positive, got {size_usdc}")
+    db = db or get_db()
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "SELECT is_maker_resting FROM positions WHERE id = ?",
+            (position_id,),
+        )
+        row = await cur.fetchone()
+        if not row or row[0] != 1:
+            return None  # already debited or position gone — no-op
+        # Clear the resting flag and write the trade_open in one txn.
+        await conn.execute(
+            "UPDATE positions SET is_maker_resting = 0 WHERE id = ?",
+            (position_id,),
+        )
+        current = await _current_balance(conn, "trading")
+        new_balance = current - size_usdc
+        await _append_ledger(
+            conn,
+            pool="trading",
+            event_type="trade_open",
+            amount=-size_usdc,
+            balance_after=new_balance,
+            position_id=position_id,
+            memo=memo or f"maker bid filled (position {position_id})",
+        )
+    log.info(
+        "fill_maker_bid: position=%d size=%.2f trading_balance=%.2f",
+        position_id, size_usdc, new_balance,
+    )
+    return new_balance
+
+
+async def cancel_maker_bid(
+    position_id: int,
+    *,
+    db: Optional[Database] = None,
+) -> bool:
+    """Mark a never-filled resting maker bid as cancelled. No ledger ops.
+
+    Idempotent: returns True only if this call actually cleared the
+    resting flag (so the caller can decide whether to log the cancel).
+    For taker orders or already-filled maker orders, callers must use
+    refund_trade() instead — those had a real debit to undo.
+    """
+    db = db or get_db()
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "SELECT is_maker_resting, status FROM positions WHERE id = ?",
+            (position_id,),
+        )
+        row = await cur.fetchone()
+        if not row or row[0] != 1:
+            return False  # not a resting maker — caller should refund instead
+        await conn.execute(
+            "UPDATE positions SET is_maker_resting = 0, status = 'cancelled' "
+            "WHERE id = ?",
+            (position_id,),
+        )
+    log.info("cancel_maker_bid: position=%d (no ledger op)", position_id)
+    return True
 
 
 async def refund_trade(

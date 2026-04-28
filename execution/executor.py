@@ -29,7 +29,10 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
-from capital.pools import InsufficientFundsError, open_trade, refund_trade
+from capital.pools import (
+    InsufficientFundsError, cancel_maker_bid, fill_maker_bid, open_trade,
+    refund_trade,
+)
 from config import get_config
 from db.database import Database, get_db
 from execution.risk import OrderRequest
@@ -147,19 +150,27 @@ class Executor:
         # AFTER the CLOB order was placed, leaving the order orphaned.
         await self._ensure_market_stub(req.token_id)
 
-        # 2. Persist position row + deduct trading pool atomically.
+        # 2. Persist position row. For taker orders we deduct the
+        #    trading pool right here (the order crosses the book
+        #    immediately, so principal is gone). For maker orders we
+        #    defer the debit until fill — a resting bid that times out
+        #    cost us nothing on-chain, so the ledger shouldn't pretend
+        #    otherwise. is_maker_resting=1 marks the position as
+        #    "ledger debit pending" so risk.py still treats the
+        #    principal as committed for sizing.
         try:
             position_id = await db.execute(
                 """INSERT INTO positions
                    (market_token_id, strategy, entry_price, size_usdc,
                     shares, order_id, tx_hash, status, opened_at, notes,
-                    leader_wallet)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+                    leader_wallet, is_maker_resting)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
                 (req.token_id, req.strategy, req.limit_price, req.size_usdc,
                  shares, order_id, tx_hash, int(time.time()), req.memo,
-                 req.leader_wallet),
+                 req.leader_wallet, 1 if req.is_maker else 0),
             )
-            await open_trade(position_id, req.size_usdc, db=db, memo=req.memo)
+            if not req.is_maker:
+                await open_trade(position_id, req.size_usdc, db=db, memo=req.memo)
         except InsufficientFundsError as e:
             # This should never happen — risk.py already checked — but if it
             # does we must cancel the CLOB order to not leave hanging capital.
@@ -255,6 +266,22 @@ class Executor:
                 continue
             state = (status or {}).get("status", "").upper()
             if state in ("MATCHED", "FILLED"):
+                # If this was a maker bid, the ledger debit was deferred
+                # until now. fill_maker_bid is idempotent — if the
+                # reconciler beat us to it, this is a no-op.
+                row = await db.fetchone(
+                    "SELECT size_usdc, is_maker_resting FROM positions "
+                    "WHERE id = ?", (position_id,),
+                )
+                if row and row["is_maker_resting"]:
+                    try:
+                        await fill_maker_bid(
+                            position_id, float(row["size_usdc"]), db=db,
+                            memo=f"maker bid #{position_id} filled",
+                        )
+                    except Exception as e:
+                        log.error("fill_maker_bid failed for %d: %s",
+                                  position_id, e)
                 await db.log_event(
                     "info", "executor",
                     f"position {position_id} filled",
@@ -268,13 +295,13 @@ class Executor:
                 ))
                 return
             if state in ("CANCELED", "CANCELLED", "EXPIRED"):
-                await self._refund_and_mark_cancelled(position_id, state)
+                await self._close_unfilled(position_id, state)
                 return
 
-        # Timed out — cancel to free capital and mark failed.
+        # Timed out — cancel to free capital and mark cancelled.
         log.warning("order %s did not fill within timeout, cancelling", order_id)
         await self._cancel(order_id)
-        await self._refund_and_mark_cancelled(position_id, "timeout")
+        await self._close_unfilled(position_id, "timeout")
 
     async def _cancel(self, order_id: Optional[str]) -> None:
         if not order_id:
@@ -284,28 +311,49 @@ class Executor:
         except Exception as e:
             log.error("cancel failed for %s: %s", order_id, e)
 
-    async def _refund_and_mark_cancelled(
+    async def _close_unfilled(
         self, position_id: int, reason: str
     ) -> None:
-        """Mark a position cancelled AND refund its locked principal back
-        to the trading pool. Without the refund, capital stays phantom-
-        locked and the risk layer undersizes future trades."""
+        """Mark a position cancelled. Refunds principal only when there
+        was a real debit to undo — resting maker bids that never filled
+        skipped the trade_open ledger entry, so there's nothing to give
+        back, and writing a phantom refund would invent capital and
+        drift the ledger upward.
+
+        For taker orders (or maker orders that filled and somehow
+        ended up here): refund as before.
+        """
         db = self.state.db
         row = await db.fetchone(
-            "SELECT size_usdc, status, market_token_id, entry_price FROM positions WHERE id = ?",
+            "SELECT size_usdc, status, market_token_id, entry_price, "
+            "is_maker_resting FROM positions WHERE id = ?",
             (position_id,),
         )
         if not row:
             return
-        # Idempotence: don't double-refund if already cancelled.
+        # Idempotence: don't double-process if already cancelled.
         if row["status"] == "cancelled":
             return
         principal = float(row["size_usdc"])
         our_bid = float(row["entry_price"])
         token_id = row["market_token_id"]
+        is_resting = bool(row["is_maker_resting"])
 
         # Snapshot the current order book so we can see WHY we didn't fill.
         market_state = await self._snapshot_market(token_id)
+
+        if is_resting:
+            # Maker bid that never filled — no debit to undo.
+            await cancel_maker_bid(position_id, db=db)
+            await db.log_event(
+                "info", "executor",
+                f"maker bid {position_id} cancelled ({reason}) — "
+                f"our_bid={our_bid:.4f} market={market_state} (no debit)",
+                {"position_id": position_id, "reason": reason,
+                 "our_bid": our_bid, "market": market_state},
+            )
+            return
+
         await db.execute(
             "UPDATE positions SET status = 'cancelled' WHERE id = ?",
             (position_id,),

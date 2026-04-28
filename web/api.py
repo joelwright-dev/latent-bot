@@ -188,17 +188,24 @@ def create_app(state: StateManager) -> FastAPI:
             # us as holding shares). For the user this matters: a row
             # that says "open" might mean either, and the est. P&L on a
             # resting bid is meaningless.
+            #
+            # Authoritative source: positions.is_maker_resting, set by
+            # the executor when placing the bid and cleared by either
+            # the executor's fill watcher or the reconciler. Falls back
+            # to the legacy heuristic (sync timestamps, age window) for
+            # rows opened before schema v14.
             opened_at = int(d.get("opened_at") or 0)
             age_secs = now - opened_at
             sync_at = d.get("pm_last_sync_at")
             if d.get("status") in ("open", "awaiting_redeem"):
-                if sync_at:
+                if d.get("is_maker_resting"):
+                    d["fill_state"] = "resting"
+                elif sync_at:
                     d["fill_state"] = "filled"
                 elif age_secs < 240:
-                    # Within 4 min, reconciler may not have run yet.
                     d["fill_state"] = "pending"
                 else:
-                    d["fill_state"] = "resting"  # bid in book, no fill
+                    d["fill_state"] = "filled"
             else:
                 d["fill_state"] = d.get("status")
 
@@ -1640,7 +1647,8 @@ def create_app(state: StateManager) -> FastAPI:
                 "trading_balance": trading_bal,
                 "gain_balance": gain_bal,
                 "principal_in_open_positions": float(locked_open or 0.0),
-                "available_to_deploy": trading_bal,
+                "pending_maker_principal": await pools.get_pending_maker_principal(db),
+                "available_to_deploy": await pools.get_available_balance(db),
                 "recent_ledger": [dict(r) for r in ledger_rows],
             },
             "positions_summary": {
