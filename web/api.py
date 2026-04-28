@@ -140,11 +140,13 @@ def create_app(state: StateManager) -> FastAPI:
         trading = await pools.get_trading_balance()
         gain = await pools.get_gain_balance()
         available = await pools.get_available_balance()
+        pending_maker = await pools.get_pending_maker_principal()
         return {
             "trading_pool": trading,
             "gain_pool": gain,
             "available_balance": available,
             "locked": trading - available,
+            "pending_maker_principal": pending_maker,
         }
 
     # ------------------------------------------------------------------
