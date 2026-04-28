@@ -1424,6 +1424,21 @@ def create_app(state: StateManager) -> FastAPI:
         }
 
     # ------------------------------------------------------------------
+    # POST /api/whales/rescore — kick a fresh scoring cycle now
+    # ------------------------------------------------------------------
+    # Default cadence is 6h; this lets the operator force-rescore after
+    # tweaking E criteria so they don't have to wait for the next pass
+    # to see updated win rates / hypothetical PnL.
+    @app.post("/api/whales/rescore",
+              dependencies=[Depends(require_auth)])
+    async def whales_rescore() -> dict:
+        state.whale_scorer_force_refresh = True
+        return {
+            "ok": True,
+            "note": "rescore queued — starts within 60s, takes ~2 min for 50 whales",
+        }
+
+    # ------------------------------------------------------------------
     # POST /api/whales/promote — add a wallet to the E allowlist
     # ------------------------------------------------------------------
     # The "yes I trust this whale, follow them live" button. Updates the

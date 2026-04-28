@@ -41,23 +41,39 @@ class WhaleScorer:
     def __init__(self, state: StateManager):
         self.state = state
         self._running = False
+        self._last_cycle_at = 0.0
 
     async def run(self) -> None:
         self._running = True
         log.info("whale_scorer starting (every %ds)", SCORE_INTERVAL_SECS)
         await asyncio.sleep(INITIAL_DELAY_SECS)
+        # Tick at 60s so the dashboard's "force rescore" button has
+        # quick latency (sets state.whale_scorer_force_refresh = True
+        # and we wake up within a minute), without us actually running
+        # the heavy /activity-scan cycle more often than configured.
         while self._running:
             try:
-                await self._cycle()
+                forced = bool(getattr(self.state, "whale_scorer_force_refresh", False))
+                elapsed = time.time() - self._last_cycle_at
+                if forced or elapsed >= SCORE_INTERVAL_SECS:
+                    if forced:
+                        self.state.whale_scorer_force_refresh = False
+                    await self._cycle()
+                    self._last_cycle_at = time.time()
             except Exception:
                 log.exception("whale_scorer cycle failed")
                 await self.state.db.log_event(
                     "error", "whale_scorer", "cycle failed (see logs)"
                 )
-            await asyncio.sleep(SCORE_INTERVAL_SECS)
+                self._last_cycle_at = time.time()
+            await asyncio.sleep(60)
 
     def stop(self) -> None:
         self._running = False
+
+    @property
+    def last_cycle_at(self) -> float:
+        return self._last_cycle_at
 
     async def _cycle(self) -> None:
         cfg = get_config()
@@ -100,6 +116,7 @@ class WhaleScorer:
         )
 
         # Reuse one HTTP session across all the whale scoring calls.
+        totals = {"signals": 0, "wins": 0, "losses": 0, "pending": 0, "scored": 0}
         async with aiohttp.ClientSession() as session:
             for entry in leaderboard:
                 if not self._running:
@@ -123,12 +140,20 @@ class WhaleScorer:
                     result=result,
                     cfg=cfg,
                 )
+                totals["scored"] += 1
+                totals["signals"] += result["signals_n"]
+                totals["wins"] += result["wins_n"]
+                totals["losses"] += result["losses_n"]
+                totals["pending"] += result["pending_n"]
                 # Small jitter so we don't hit the apis in lockstep.
                 await asyncio.sleep(0.2)
 
         await self.state.db.log_event(
             "info", "whale_scorer",
-            f"scored {len(leaderboard)} whales — see /api/whales/leaderboard",
+            f"scored {totals['scored']} whales: "
+            f"{totals['signals']} signals, {totals['wins']}W/{totals['losses']}L "
+            f"+{totals['pending']} pending",
+            totals,
         )
 
     async def _fetch_leaderboard(

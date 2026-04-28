@@ -76,11 +76,18 @@ def _outcome_index(market: dict, outcome_str: str) -> Optional[int]:
 
 def _market_resolution(market: dict) -> tuple[bool, Optional[list[float]]]:
     """Returns (is_resolved, outcome_prices). Outcome prices are floats
-    in [0, 1] — 1.0 = winner, 0.0 = loser. Polymarket sometimes leaves
-    outcomePrices unset on closed markets that ended in a 50/50 dispute;
-    treat those as unresolved."""
-    if not market.get("closed"):
-        return (False, None)
+    in [0, 1] — 1.0 = winner, 0.0 = loser.
+
+    Resolution is decided by the actual price shape, not the `closed`
+    field — gamma-api returns `closed=true` only for fully archived
+    markets and many recently-resolved ones still report `closed=false`.
+    The reliable signal is outcomePrices being a clean ~1/~0 pair.
+
+    To avoid mis-classifying a LIVE near-decided market (0.99/0.01
+    while still trading) as resolved, we additionally require either
+    `closed=true` OR `endDate` more than 6h in the past. A market
+    trading 0.99 with the event still in the future is not resolved.
+    """
     op = _json_or_passthrough(market.get("outcomePrices"))
     if not op:
         return (False, None)
@@ -88,10 +95,26 @@ def _market_resolution(market: dict) -> tuple[bool, Optional[list[float]]]:
         prices = [float(p) for p in op]
     except Exception:
         return (False, None)
-    # Sanity: a resolved binary market has one 1.0 and one 0.0.
-    if len(prices) >= 2 and any(abs(p - 0.5) < 0.01 for p in prices):
+    if len(prices) < 2:
         return (False, None)
-    return (True, prices)
+
+    # Clean winner/loser shape: one outcome ≥ 0.98, another ≤ 0.02.
+    # 50/50 disputes (0.5/0.5) and live prices (0.6/0.4 etc.) fail.
+    has_winner = any(p >= 0.98 for p in prices)
+    has_loser = any(p <= 0.02 for p in prices)
+    if not (has_winner and has_loser):
+        return (False, None)
+
+    if market.get("closed"):
+        return (True, prices)
+    # closed flag missing/false but prices look extreme — verify via
+    # endDate. A live market trading 0.99 with the event still ahead
+    # is NOT resolved; only count past-end markets as settled.
+    import time as _t
+    end_ts = _parse_iso_ts(market.get("endDate"))
+    if end_ts and (_t.time() - end_ts) > 6 * 3600:
+        return (True, prices)
+    return (False, None)
 
 
 async def _fetch_trades(session: aiohttp.ClientSession, wallet: str) -> list[dict]:

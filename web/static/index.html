@@ -527,7 +527,10 @@
             </span>
             Hypothetical PnL is per $1 wagered. Promote to add the wallet to STRATEGY_E_WHALE_ALLOWLIST.
           </div>
-          <button class="btn ml-auto" @click="loadWhaleProspects">refresh</button>
+          <div class="ml-auto flex gap-2">
+            <button class="btn" @click="loadWhaleProspects" title="Re-read scores from /api/whales/leaderboard">refresh view</button>
+            <button class="btn" @click="rescoreWhales" title="Force a fresh scoring pass against current E criteria. Takes ~2 min.">🔄 rescore now</button>
+          </div>
         </div>
         <div v-if="promoteMsg" class="text-xs"
              :class="promoteMsg.startsWith('✓') ? 'text-emerald-400' : 'text-rose-400'">
@@ -1833,6 +1836,18 @@ createApp({
       } catch (e) { /* ignore */ }
     };
 
+    const rescoreWhales = async () => {
+      promoteMsg.value = '';
+      try {
+        await postJson('/api/whales/rescore', {});
+        promoteMsg.value = '✓ rescore queued — refresh in ~2 min';
+        // Auto-reload the view a couple minutes later so fresh scores show up.
+        setTimeout(() => { loadWhaleProspects(); promoteMsg.value = ''; }, 130000);
+      } catch (e) {
+        promoteMsg.value = '✗ ' + e.message;
+      }
+    };
+
     const promoteWhale = async (wallet) => {
       promoteMsg.value = '';
       try {
@@ -2320,7 +2335,7 @@ createApp({
       leaders, leadersMeta, loadLeaders, fmtAgeDelta,
       whales, whalesMeta, loadWhales,
       whaleProspects, whaleProspectsMeta, loadWhaleProspects,
-      promoteWhale, demoteWhale, promoteMsg,
+      promoteWhale, demoteWhale, promoteMsg, rescoreWhales,
       dStats, loadStrategyDStats,
       forceRefreshDLeaders, rosterRefreshMsg,
       portfolio, loadPortfolio, ledgerDelta, reconcileLedger, reconcileBusy,
